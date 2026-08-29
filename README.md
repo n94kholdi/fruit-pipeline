@@ -89,6 +89,22 @@ python -m fruit_pipeline.cli --image path/to/image.jpg --output_dir ./out
 Produces `out/<stem>_detections.json`, `out/<stem>_final.png`, and
 `out/<stem>_tiles.png`, and prints the total fruit count to the console.
 
+### Whole-image detector inference (no tiling)
+
+To inspect the detector's predictions on the complete image without SAHI,
+merging, or SAM segmentation, use the standalone inference command:
+
+```bash
+python inference.py \
+  --image path/to/image.jpg \
+  --weights models/best.pt \
+  --conf-threshold 0.25 \
+  --output-dir outputs/whole_image
+```
+
+`--image` may also be a directory (processed non-recursively). For every
+input, this writes `<stem>_prediction.jpg` and `<stem>_detections.json`.
+
 ### Batch mode (a folder of images)
 
 Pass a directory to `--image` instead of a single file to process every

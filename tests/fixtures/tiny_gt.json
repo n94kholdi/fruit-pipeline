@@ -1,0 +1,14 @@
+{
+  "images": [
+    {"id": 1, "file_name": "img1.jpg", "width": 200, "height": 200},
+    {"id": 2, "file_name": "img2.jpg", "width": 300, "height": 300}
+  ],
+  "annotations": [
+    {"id": 1, "image_id": 1, "category_id": 1, "bbox": [10, 10, 10, 10], "area": 100, "iscrowd": 0},
+    {"id": 2, "image_id": 1, "category_id": 1, "bbox": [40, 10, 20, 20], "area": 400, "iscrowd": 0},
+    {"id": 3, "image_id": 1, "category_id": 1, "bbox": [10, 60, 50, 50], "area": 2500, "iscrowd": 0},
+    {"id": 4, "image_id": 2, "category_id": 1, "bbox": [0, 0, 120, 120], "area": 14400, "iscrowd": 0},
+    {"id": 5, "image_id": 2, "category_id": 1, "bbox": [130, 10, 50, 50], "area": 2500, "iscrowd": 0}
+  ],
+  "categories": [{"id": 1, "name": "fruit"}]
+}

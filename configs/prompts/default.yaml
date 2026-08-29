@@ -1,0 +1,29 @@
+# Attribute-rich open-vocab prompt set for --detector yolo-world / --detector yoloe --yoloe-mode text.
+#
+# SDM-D (arXiv 2411.16196) found CLIP-style text matching does better on
+# descriptive visual attributes than bare class names, and that giving the
+# model an explicit background/other class to absorb non-fruit regions cuts
+# false positives -- both applied here. Copy this file and pass your own via
+# --prompt-config to tune for a specific fruit mix / camera setup.
+
+classes:
+  - name: fruit
+    prompts:
+      - "a round orange citrus fruit"
+      - "a ripe red apple"
+      - "a green apple"
+      - "a yellow banana"
+      - "a bunch of grapes"
+      - "a green pear"
+      - "a red or green round fruit"
+      - "a small citrus fruit"
+      - "a single whole fruit"
+
+  - name: background
+    prompts:
+      - "background"
+      - "wooden crate"
+      - "cardboard box"
+      - "plastic crate wall"
+      - "empty table surface"
+      - "a person's hand"

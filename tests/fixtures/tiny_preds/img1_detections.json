@@ -1,0 +1,16 @@
+{
+  "image_path": "img1.jpg",
+  "image_width": 200,
+  "image_height": 200,
+  "num_tiles": 1,
+  "raw_detection_count": 3,
+  "detection_tile_size": 200,
+  "estimated_fruit_diameter_px": null,
+  "detection_image_size": [200, 200],
+  "num_fruits": 3,
+  "detections": [
+    {"instance_id": 0, "box": [10.0, 10.0, 20.0, 20.0], "detector_score": 0.95, "sam_score": 0.9, "category_name": "fruit", "mask_area": 100, "mask_polygon": []},
+    {"instance_id": 1, "box": [40.0, 10.0, 60.0, 30.0], "detector_score": 0.9, "sam_score": 0.9, "category_name": "fruit", "mask_area": 400, "mask_polygon": []},
+    {"instance_id": 2, "box": [150.0, 150.0, 170.0, 170.0], "detector_score": 0.6, "sam_score": 0.6, "category_name": "fruit", "mask_area": 400, "mask_polygon": []}
+  ]
+}

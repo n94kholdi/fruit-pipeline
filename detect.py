@@ -16,16 +16,16 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from sahi.annotation import Category
-from sahi.auto_model import AutoDetectionModel
-from sahi.models.base import DetectionModel
-from sahi.predict import get_prediction
 from sahi.prediction import ObjectPrediction
 from sahi.slicing import slice_image
 from sahi.utils.cv import read_image_as_pil
 
+from fruit_pipeline.detectors import DetectorBackend, _relabel_class_agnostic, load_detector_backend
+
 logger = logging.getLogger(__name__)
 
+# Deprecated: kept only so old callers referencing this name don't break.
+# Prompting now goes through prompts.PromptConfig / --prompt-config.
 DEFAULT_PROMPT_CLASSES = ["fruit", "round fruit", "apple", "orange", "citrus fruit"]
 
 
@@ -36,6 +36,24 @@ class TileStats:
     image_size: tuple[int, int]  # (width, height)
     tile_size: int = 0
     estimated_fruit_diameter_px: float | None = None
+
+
+@dataclass
+class TiledDetectionResult:
+    """Full return value of ``detect_tiled``: raw predictions plus per-tile provenance.
+
+    ``tile_ids``/``tile_rects`` exist so ``merge.py``'s seam-aware strategy
+    can tell whether two overlapping detections came from different tiles
+    near a shared seam (probably the same fruit, split by tiling -> union
+    them) versus two genuinely different, merely-adjacent fruit detected
+    within the same tile or from non-adjacent tiles (never union those).
+    """
+
+    raw_predictions: list[ObjectPrediction]
+    tile_results: list[TileResult]
+    stats: "TileStats"
+    tile_ids: list[int]  # parallel to raw_predictions; -1 = standard full-image pass (never seam-eligible)
+    tile_rects: dict[int, tuple[float, float, float, float]]  # tile_id -> (x1, y1, x2, y2) in full-image coords
 
 
 @dataclass
@@ -56,10 +74,11 @@ class TileResult:
 
 def estimate_fruit_diameter_px(
     image_arr: np.ndarray,
-    detection_model: DetectionModel,
+    backend: DetectorBackend,
     target_long_edge: int = 1400,
     min_detections: int = 3,
     max_box_area_fraction: float = 0.08,
+    conf_threshold: float = 0.25,
 ) -> float | None:
     """Fast pre-pass: estimate the median fruit diameter, in full-res pixels.
 
@@ -97,14 +116,12 @@ def estimate_fruit_diameter_px(
         small = image_arr
         scale = 1.0
 
-    result = get_prediction(
-        image=small,
-        detection_model=detection_model,
-        shift_amount=[0, 0],
-        full_shape=[small.shape[0], small.shape[1]],
-        verbose=0,
+    preds = backend.detect(
+        small,
+        shift=(0, 0),
+        full_shape=(small.shape[0], small.shape[1]),
+        conf_threshold=conf_threshold,
     )
-    preds = result.object_prediction_list
 
     small_area = float(small.shape[0] * small.shape[1])
     max_box_area = max_box_area_fraction * small_area
@@ -192,49 +209,25 @@ def load_detector(
     conf_threshold: float = 0.25,
     use_yolo_world: bool = False,
     prompt_classes: list[str] | None = None,
-) -> DetectionModel:
-    """Load an Ultralytics detector and wrap it as a SAHI ``DetectionModel``.
+) -> DetectorBackend:
+    """Deprecated: use ``detectors.load_detector_backend`` directly.
 
-    When ``use_yolo_world`` is True, the loaded model must be a YOLO-World
-    checkpoint (e.g. ``yolov8s-world.pt``); it is switched into open-vocabulary
-    mode with ``prompt_classes`` so detection is not limited to COCO's 80
-    classes. Otherwise the model runs as a plain detector and every detected
-    box is relabeled to a single generic "fruit" category downstream
-    (see ``detect_tiled``), so all 80 COCO classes contribute recall instead
-    of relying on COCO's fixed label set matching the actual fruit type.
+    Kept for backward compatibility with any external caller importing this
+    name; returns a ``DetectorBackend`` now instead of a raw SAHI
+    ``DetectionModel`` (``detect_tiled`` takes a backend, not a model).
     """
-    from ultralytics import YOLO
-
-    model = YOLO(weights_path)
-
-    if use_yolo_world:
-        classes = prompt_classes or DEFAULT_PROMPT_CLASSES
-        logger.info("Loading YOLO-World with prompt classes: %s", classes)
-        model.set_classes(classes)
-
-    detection_model = AutoDetectionModel.from_pretrained(
-        model_type="ultralytics",
-        model=model,
+    return load_detector_backend(
+        detector="yolo-world" if use_yolo_world else "default",
+        weights_path=weights_path,
         device=device,
-        confidence_threshold=conf_threshold,
+        conf_threshold=conf_threshold,
+        fruit_prompts=prompt_classes or (DEFAULT_PROMPT_CLASSES if use_yolo_world else None),
     )
-    return detection_model
-
-
-def _relabel_class_agnostic(predictions: list[ObjectPrediction], label: str = "fruit") -> None:
-    """Relabel every prediction's category in-place so merging treats them as one class.
-
-    Only applied when the detector is a plain (non YOLO-World) model, since
-    we intentionally ignore COCO's 80-class labels and treat any detected
-    object as a fruit candidate.
-    """
-    for pred in predictions:
-        pred.category = Category(id=0, name=label)
 
 
 def detect_tiled(
     image_path: str,
-    detection_model: DetectionModel,
+    backend: DetectorBackend,
     tile_size: int | None = None,
     overlap_ratio: float = 0.15,
     conf_threshold: float = 0.25,
@@ -248,12 +241,12 @@ def detect_tiled(
     coarse_max_box_area_fraction: float = 0.08,
     fallback_tile_size: int = 640,
     debug_tiles_dir: str | None = None,
-) -> tuple[list[ObjectPrediction], list[TileResult], TileStats]:
+) -> TiledDetectionResult:
     """Slice ``image_path`` into tiles, run the detector on each, and return raw detections.
 
     Args:
         image_path: Path to the full-resolution input image.
-        detection_model: A SAHI ``DetectionModel`` from ``load_detector``.
+        backend: A ``DetectorBackend`` from ``detectors.load_detector_backend``.
         tile_size: Square tile side length in pixels. If None (default), it is
             estimated per-image: a fast coarse pre-pass
             (``estimate_fruit_diameter_px``) finds the median fruit diameter,
@@ -296,10 +289,11 @@ def detect_tiled(
             immediately obvious).
 
     Returns:
-        (raw_object_predictions, tile_results, stats) — raw_object_predictions
-        are un-merged, already shifted into full original-image coordinates;
-        tile_results holds each tile's own crop + local-coordinate detections
-        for the per-tile debugging visualization.
+        A ``TiledDetectionResult``: raw predictions (un-merged, already
+        shifted into full original-image coordinates), each tile's own crop
+        + local-coordinate detections (for the per-tile debugging
+        visualization), and per-tile provenance (``tile_ids``/``tile_rects``)
+        for seam-aware merging.
     """
     pil_image = read_image_as_pil(image_path)
     image_arr = np.ascontiguousarray(pil_image)
@@ -309,9 +303,10 @@ def detect_tiled(
     if tile_size is None:
         estimated_diameter = estimate_fruit_diameter_px(
             image_arr,
-            detection_model,
+            backend,
             target_long_edge=coarse_pass_long_edge,
             max_box_area_fraction=coarse_max_box_area_fraction,
+            conf_threshold=conf_threshold,
         )
         if estimated_diameter is None:
             tile_size = compute_adaptive_tile_size(
@@ -368,36 +363,30 @@ def detect_tiled(
 
     raw_predictions: list[ObjectPrediction] = []
     tile_results: list[TileResult] = []
+    tile_ids: list[int] = []
+    tile_rects: dict[int, tuple[float, float, float, float]] = {}
 
     for idx, (sliced_image, starting_pixel) in enumerate(zip(slice_result.images, slice_result.starting_pixels)):
         shift_x, shift_y = int(starting_pixel[0]), int(starting_pixel[1])
         tile_h, tile_w = sliced_image.shape[0], sliced_image.shape[1]
+        tile_rects[idx] = (float(shift_x), float(shift_y), float(shift_x + tile_w), float(shift_y + tile_h))
 
         if debug_tiles_dir:
             tile_bgr = cv2.cvtColor(sliced_image, cv2.COLOR_RGB2BGR)
             cv2.imwrite(str(Path(debug_tiles_dir) / f"tile_{idx:03d}_x{shift_x}_y{shift_y}.png"), tile_bgr)
 
-        result = get_prediction(
-            image=sliced_image,
-            detection_model=detection_model,
-            shift_amount=[shift_x, shift_y],
-            full_shape=[height, width],
-            confidence_threshold=conf_threshold,
-            verbose=0,
+        # backend.detect() already returns full-image-shifted predictions
+        # (each DetectorBackend implementation handles its own shift, e.g.
+        # SahiUltralyticsBackend via SAHI's get_shifted_object_prediction()),
+        # so no separate shifting step is needed here.
+        shifted_predictions = backend.detect(
+            sliced_image,
+            shift=(shift_x, shift_y),
+            full_shape=(height, width),
+            conf_threshold=conf_threshold,
         )
-        # NOTE: SAHI's get_prediction() returns ObjectPredictions with their
-        # bbox still in tile-LOCAL coordinates even when given shift_amount /
-        # full_shape — the shift is only stored on the prediction and must be
-        # applied explicitly via get_shifted_object_prediction() (this is what
-        # SAHI's own get_sliced_prediction() does internally). Skipping that
-        # call here previously left every non-zero-shift tile's detections in
-        # tile-local coordinates, so after merging they landed nowhere near
-        # their real position for every tile except tile 0 (whose shift is
-        # (0, 0), making local == full-image coordinates by coincidence) —
-        # this was the root cause of "only the first tile or two show fruit".
-        local_predictions = result.object_prediction_list
-        shifted_predictions = [pred.get_shifted_object_prediction() for pred in local_predictions]
         raw_predictions.extend(shifted_predictions)
+        tile_ids.extend([idx] * len(shifted_predictions))
 
         logger.info(
             "Tile %d: bounds=(%d,%d)-(%d,%d) size=%dx%d raw_detections=%d",
@@ -408,7 +397,7 @@ def detect_tiled(
             shift_y + tile_h,
             tile_w,
             tile_h,
-            len(local_predictions),
+            len(shifted_predictions),
         )
 
         tile_results.append(
@@ -416,34 +405,35 @@ def detect_tiled(
                 label=f"tile {idx}",
                 image_rgb=sliced_image,
                 shift=(shift_x, shift_y),
-                boxes_xyxy=[list(pred.bbox.to_xyxy()) for pred in local_predictions],
-                scores=[float(pred.score.value) for pred in local_predictions],
+                # boxes_xyxy is used only for the debug tile-grid visualization,
+                # drawn on the tile's own (local-coordinate) crop -- shift back
+                # down from the full-image coordinates backend.detect() returns.
+                boxes_xyxy=[
+                    [c - shift_x if i % 2 == 0 else c - shift_y for i, c in enumerate(pred.bbox.to_xyxy())]
+                    for pred in shifted_predictions
+                ],
+                scores=[float(pred.score.value) for pred in shifted_predictions],
             )
         )
 
     if include_standard_pred:
-        result = get_prediction(
-            image=image_arr,
-            detection_model=detection_model,
-            shift_amount=[0, 0],
-            full_shape=[height, width],
-            confidence_threshold=conf_threshold,
-            verbose=0,
+        shifted_predictions = backend.detect(
+            image_arr,
+            shift=(0, 0),
+            full_shape=(height, width),
+            conf_threshold=conf_threshold,
         )
-        # shift_amount is [0, 0] here, so local == full-image coordinates and
-        # get_shifted_object_prediction() is a no-op — applied anyway for
-        # consistency with the tiled predictions above.
-        local_predictions = result.object_prediction_list
-        shifted_predictions = [pred.get_shifted_object_prediction() for pred in local_predictions]
         raw_predictions.extend(shifted_predictions)
-        logger.info("Standard (full-image) pass: raw_detections=%d", len(local_predictions))
+        tile_ids.extend([-1] * len(shifted_predictions))
+        tile_rects[-1] = (0.0, 0.0, float(width), float(height))
+        logger.info("Standard (full-image) pass: raw_detections=%d", len(shifted_predictions))
         tile_results.append(
             TileResult(
                 label="full image",
                 image_rgb=image_arr,
                 shift=(0, 0),
-                boxes_xyxy=[list(pred.bbox.to_xyxy()) for pred in local_predictions],
-                scores=[float(pred.score.value) for pred in local_predictions],
+                boxes_xyxy=[list(pred.bbox.to_xyxy()) for pred in shifted_predictions],
+                scores=[float(pred.score.value) for pred in shifted_predictions],
             )
         )
 
@@ -463,4 +453,10 @@ def detect_tiled(
         stats.num_tiles,
         " + 1 standard pass" if include_standard_pred else "",
     )
-    return raw_predictions, tile_results, stats
+    return TiledDetectionResult(
+        raw_predictions=raw_predictions,
+        tile_results=tile_results,
+        stats=stats,
+        tile_ids=tile_ids,
+        tile_rects=tile_rects,
+    )
