@@ -49,7 +49,7 @@ import numpy as np
 from sahi.postprocess.combine import GreedyNMMPostprocess, NMMPostprocess
 from sahi.prediction import ObjectPrediction
 
-from fruit_pipeline.geometry import (
+from fruit_pipeline.utils.geometry import (
     box_area,
     containment_ratio,
     diou_xyxy,

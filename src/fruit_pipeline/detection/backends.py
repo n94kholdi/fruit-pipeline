@@ -1,6 +1,7 @@
 """Detector backend abstraction: one interface, three implementations.
 
-Tiling (``detect.py``) and merging (``merge.py``) only ever talk to a
+Tiling (:mod:`fruit_pipeline.detection.tiling`) and merging
+(:mod:`fruit_pipeline.detection.merging`) only ever talk to a
 ``DetectorBackend``'s ``detect()`` method, which always returns
 already-full-image-shifted ``sahi.prediction.ObjectPrediction``s — so
 neither of those stages needs to change no matter which backend runs.
@@ -36,7 +37,7 @@ from sahi.models.base import DetectionModel
 from sahi.predict import get_prediction
 from sahi.prediction import ObjectPrediction
 
-from fruit_pipeline.paths import resolve_model_path
+from fruit_pipeline.utils.paths import resolve_model_path
 
 logger = logging.getLogger(__name__)
 

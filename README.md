@@ -20,35 +20,43 @@ with the image's filename stem — no per-image subfolders):
 It intentionally stops there. Classification, sizing, and rotten/fine
 detection are separate future stages — see "Next stages" below.
 
-## How it works
+## Project structure
 
 ```
-detect.py     SAHI slices the image into tiles, runs an Ultralytics detector
-              on each tile + one full-image pass, shifts boxes back to
-              original coordinates. No merging happens here — it logs the
-              raw (pre-merge) detection count for debugging.
-merge.py      Combines overlapping raw detections with SAHI's Greedy NMM
-              (merges touching/adjacent fruit instead of deleting them, unlike
-              plain NMS), then drops boxes implausibly larger than the median
-              fruit box (heuristic for "boxed the whole crate, not one fruit").
-segment.py    Prompts SAM with each merged box (predictor.predict_torch,
-              multimask_output=False) — never SamAutomaticMaskGenerator — to
-              get exactly one mask per fruit. Then drops near-zero-area
-              masks, masks that hug an entire image edge (background/crate
-              wall), and (optionally) masks with an implausible aspect ratio.
-visualize.py  Draws the final boxes+mask overlay, and the per-tile debug grid.
-pipeline.py   Orchestrates the above and writes <stem>_detections.json,
-              <stem>_final.png, and <stem>_tiles.png.
-cli.py        argparse entrypoint.
+src/fruit_pipeline/
+├── detection/       detector backends, SAHI tiling, and cross-tile merging
+├── segmentation/    SAM loading, box prompting, and mask filters
+├── visualization/   final overlays and tile-debug rendering
+├── config/          prompt loading and packaged YAML defaults
+├── eval/            COCO adapters, metrics, and evaluation CLI
+├── utils/           shared geometry and path helpers
+├── pipeline.py      end-to-end orchestration for one image
+├── cli.py           full-pipeline command
+└── inference.py     standalone whole-image inference command
+scripts/             dataset and annotation utilities
+tests/               unit and CLI tests
 ```
+
+The short modules such as `fruit_pipeline.detect` and
+`fruit_pipeline.merge` are compatibility imports. New features should use
+the focused subpackages, for example
+`fruit_pipeline.detection.tiling` and
+`fruit_pipeline.detection.merging`.
 
 ## Setup
 
-### 1. Install dependencies
+### 1. Install the project
 
 ```bash
-pip install -r requirements.txt
+pip install -e .
 ```
+
+For evaluation or development tools, use `pip install -e '.[eval]'` or
+`pip install -e '.[dev]'` respectively. The editable install exposes the
+`fruit-pipeline`, `fruit-inference`, and `fruit-eval` commands.
+SAM is installed from Meta's official GitHub repository, matching its
+upstream installation guidance rather than relying on an unrelated PyPI
+package with a similar name.
 
 ### 2. Model weights (reuse what's already downloaded in this project)
 
@@ -77,7 +85,7 @@ and want true open-vocabulary prompting.
 SAM2 was not used here even though the repo has a `sam2.1_t.pt` checkpoint,
 because the `sam2` package (plus its Hydra config files) isn't installed in
 this environment, while `segment-anything` (SAM1) and a matching ViT-L
-checkpoint already are. Swapping `segment.py`'s `load_sam` for a SAM2
+checkpoint already are. Swapping `segmentation/sam.py`'s `load_sam` for a SAM2
 loader later is a contained change if that's ever worth it.
 
 ## Run
@@ -95,7 +103,7 @@ To inspect the detector's predictions on the complete image without SAHI,
 merging, or SAM segmentation, use the standalone inference command:
 
 ```bash
-python inference.py \
+python -m fruit_pipeline.inference \
   --image path/to/image.jpg \
   --weights models/best.pt \
   --conf-threshold 0.25 \

@@ -2,9 +2,9 @@
 
 Runs a pretrained Ultralytics detector (YOLOv8/YOLO11, optionally YOLO-World
 with a text prompt) over image tiles via SAHI, shifts every raw detection
-back into original-image coordinates, and hands the un-merged list off to
-``merge.py``. No cross-tile deduplication happens here on purpose: that is
-the merge stage's job.
+back into original-image coordinates, and hands the unmerged list to the
+dedicated merging module. No cross-tile deduplication happens here on
+purpose: that is the merge stage's job.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from sahi.prediction import ObjectPrediction
 from sahi.slicing import slice_image
 from sahi.utils.cv import read_image_as_pil
 
-from fruit_pipeline.detectors import DetectorBackend, _relabel_class_agnostic, load_detector_backend
+from fruit_pipeline.detection.backends import DetectorBackend, _relabel_class_agnostic, load_detector_backend
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ class TileStats:
 class TiledDetectionResult:
     """Full return value of ``detect_tiled``: raw predictions plus per-tile provenance.
 
-    ``tile_ids``/``tile_rects`` exist so ``merge.py``'s seam-aware strategy
+    ``tile_ids``/``tile_rects`` let the seam-aware merging strategy
     can tell whether two overlapping detections came from different tiles
     near a shared seam (probably the same fruit, split by tiling -> union
     them) versus two genuinely different, merely-adjacent fruit detected
@@ -60,7 +60,7 @@ class TiledDetectionResult:
 class TileResult:
     """One tile's own crop + the raw detections the model made on it.
 
-    Kept separate from the merged, full-image detections so ``visualize.py``
+    Kept separate from the merged, full-image detections so the visualization layer
     can render a per-tile debugging view showing exactly what the detector
     saw and predicted on each individual tile, before any cross-tile merge.
     """

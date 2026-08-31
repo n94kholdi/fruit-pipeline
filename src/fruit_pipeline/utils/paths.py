@@ -4,9 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# Repo root (this package maps fruit_pipeline -> ".").
-_PROJECT_ROOT = Path(__file__).resolve().parent
-MODELS_DIR = _PROJECT_ROOT / "models"
+def _find_project_root() -> Path:
+    """Find a source checkout, falling back to the process working directory."""
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "pyproject.toml").is_file():
+            return parent
+    return Path.cwd()
+
+
+PROJECT_ROOT = _find_project_root()
+MODELS_DIR = PROJECT_ROOT / "models"
 
 
 def resolve_model_path(path: str) -> str:

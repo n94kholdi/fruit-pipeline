@@ -1,6 +1,6 @@
 import numpy as np
 
-from fruit_pipeline.geometry import (
+from fruit_pipeline.utils.geometry import (
     box_area,
     containment_ratio,
     diou_xyxy,

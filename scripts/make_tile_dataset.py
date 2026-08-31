@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate a slicing-aided fine-tuning dataset: full images + tile crops, one COCO JSON.
 
-We tile at inference (detect.py's SAHI slicing) but train/use pretrained
+We tile at inference (``fruit_pipeline.detection.tiling``) but train/use pretrained
 weights on full images -- SAHI's own paper and ASAHI (arXiv 2604.19233) both
 show slicing-aided *fine-tuning* is a separate recall gain on top of
 slicing-aided *inference*. This script takes a COCO-format annotated
@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 from sahi.slicing import slice_image
 
-from fruit_pipeline.detect import compute_tile_size_from_diameter
+from fruit_pipeline.detection.tiling import compute_tile_size_from_diameter
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ def visible_fraction(original_box_xyxy: list[float], clipped_box_xyxy: list[floa
 def median_gt_diameter(annotations: list[dict]) -> float | None:
     """Median GT box diagonal (px), for resolution-aware ("diameter") adaptive tile sizing.
 
-    Unlike detect.py's ``estimate_fruit_diameter_px`` (which needs a live
+    Unlike the inference tiler's ``estimate_fruit_diameter_px`` (which needs a live
     detector coarse-pass), we already have real ground-truth boxes here, so
     the diameter estimate is exact rather than a detector-noise-prone guess.
     """

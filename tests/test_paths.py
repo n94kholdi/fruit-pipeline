@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from fruit_pipeline.paths import MODELS_DIR, resolve_model_path
+from fruit_pipeline.utils.paths import MODELS_DIR, resolve_model_path
 
 
 def test_resolve_model_path_finds_existing_models_dir_file():

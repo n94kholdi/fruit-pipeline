@@ -15,8 +15,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from fruit_pipeline.merge import Detection
-from fruit_pipeline.paths import resolve_model_path
+from fruit_pipeline.detection.merging import Detection
+from fruit_pipeline.utils.paths import resolve_model_path
 
 logger = logging.getLogger(__name__)
 

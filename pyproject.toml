@@ -8,15 +8,36 @@ version = "0.1.0"
 description = "Pretrained-only tiled detection + segmentation pipeline for densely packed fruit images"
 readme = "README.md"
 requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "PyYAML",
+    "sahi",
+    "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
+    "torch",
+    "torchvision",
+    "ultralytics",
+]
 
-# This directory is named 'fruit-pipeline' (hyphen), but every module and
-# the README document `import fruit_pipeline` / `python -m fruit_pipeline.cli`
-# (underscore) -- this mapping is what actually makes that importable,
-# without renaming the directory itself. Install with `pip install -e .`
-# from within this directory.
+[project.optional-dependencies]
+eval = ["pycocotools"]
+dev = ["pycocotools", "pytest"]
+
 [tool.setuptools]
-package-dir = { "fruit_pipeline" = "." }
-packages = ["fruit_pipeline", "fruit_pipeline.eval"]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fruit_pipeline = ["config/prompts/*.yaml"]
+
+[project.scripts]
+fruit-pipeline = "fruit_pipeline.cli:main"
+fruit-inference = "fruit_pipeline.inference:main"
+fruit-eval = "fruit_pipeline.eval.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,4 +1,4 @@
-"""CLI entrypoint: ``python -m fruit_pipeline.eval run|compare``."""
+"""Evaluation CLI: ``python -m fruit_pipeline.eval run|compare``."""
 
 from __future__ import annotations
 

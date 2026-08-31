@@ -1,4 +1,4 @@
-"""``--compare a.json b.json``: a side-by-side delta table between two ``eval run`` outputs."""
+"""Build a side-by-side delta table between two evaluation outputs."""
 
 from __future__ import annotations
 

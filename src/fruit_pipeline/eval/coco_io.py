@@ -1,4 +1,4 @@
-"""Bridges fruit_pipeline's own JSON formats to/from COCO.
+"""Bridge fruit-pipeline's JSON formats to and from COCO.
 
 ``metrics.py`` deliberately knows nothing about COCO or pycocotools — it
 only takes plain ``{image_id: [[x1,y1,x2,y2], ...]}``-shaped dicts, so it's

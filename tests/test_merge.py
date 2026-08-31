@@ -1,6 +1,6 @@
 from sahi.prediction import ObjectPrediction
 
-from fruit_pipeline.merge import filter_oversized_boxes, merge_detections, to_detections
+from fruit_pipeline.detection.merging import filter_oversized_boxes, merge_detections, to_detections
 
 
 def _pred(box, score=0.9, category_id=0, category_name="fruit"):

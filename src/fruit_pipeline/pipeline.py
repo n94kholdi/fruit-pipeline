@@ -12,12 +12,12 @@ import cv2
 import numpy as np
 import torch
 
-from fruit_pipeline.detect import TileStats, detect_tiled
-from fruit_pipeline.detectors import DetectorBackend, load_detector_backend
-from fruit_pipeline.merge import filter_oversized_boxes, merge_detections, to_detections
-from fruit_pipeline.prompts import DEFAULT_PROMPT_CONFIG_PATH, load_prompt_config
-from fruit_pipeline.segment import FruitInstance, filter_masks, load_sam, segment_boxes
-from fruit_pipeline.visualize import draw_overlays, draw_tile_grid
+from fruit_pipeline.config.prompts import DEFAULT_PROMPT_CONFIG_PATH, load_prompt_config
+from fruit_pipeline.detection.backends import DetectorBackend, load_detector_backend
+from fruit_pipeline.detection.merging import filter_oversized_boxes, merge_detections, to_detections
+from fruit_pipeline.detection.tiling import TileStats, detect_tiled
+from fruit_pipeline.segmentation.sam import FruitInstance, filter_masks, load_sam, segment_boxes
+from fruit_pipeline.visualization.rendering import draw_overlays, draw_tile_grid
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ class PipelineConfig:
     detector: str = "default"  # "default" | "yolo-world" | "yoloe"
     use_yolo_world: bool = False  # deprecated: equivalent to detector="yolo-world", kept for old callers
     prompt_classes: list[str] | None = None  # legacy override; if set, wins over prompt_config (no background split)
-    prompt_config: str | None = None  # path to a prompts.PromptConfig YAML; defaults to configs/prompts/default.yaml
+    prompt_config: str | None = None  # custom PromptConfig YAML; None uses the packaged default
     yoloe_mode: str = "text"  # "text" | "visual" | "prompt_free" -- detector="yoloe" only
     visual_prompt_paths: list[str] = field(default_factory=list)  # exemplar crop paths -- yoloe_mode="visual" only
     tile_size: int | None = None  # None = adaptive (estimated from fruit diameter); set to force a fixed size
@@ -92,7 +92,7 @@ def _resolve_prompts(config: PipelineConfig) -> tuple[list[str], list[str]]:
 
     ``prompt_classes`` (legacy, comma-separated CLI flag) wins if set, with
     no background split. Otherwise loads ``prompt_config`` (default:
-    ``configs/prompts/default.yaml``), which carries both.
+    packaged default YAML), which carries both.
     """
     if config.prompt_classes:
         return list(config.prompt_classes), []

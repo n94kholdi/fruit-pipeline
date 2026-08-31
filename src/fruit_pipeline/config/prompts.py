@@ -73,4 +73,4 @@ def load_prompt_config(path: str) -> PromptConfig:
     return PromptConfig(fruit_prompts=fruit_prompts, background_prompts=background_prompts)
 
 
-DEFAULT_PROMPT_CONFIG_PATH = str(Path(__file__).parent / "configs" / "prompts" / "default.yaml")
+DEFAULT_PROMPT_CONFIG_PATH = str(Path(__file__).parent / "prompts" / "default.yaml")

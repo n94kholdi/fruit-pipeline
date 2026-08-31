@@ -7,7 +7,7 @@ follow-up (network download of a yoloe*.pt checkpoint) rather than run here.
 import numpy as np
 import pytest
 
-from fruit_pipeline.detectors import YoloeBackend, load_detector_backend
+from fruit_pipeline.detection.backends import YoloeBackend, load_detector_backend
 
 
 class _FakeModel:

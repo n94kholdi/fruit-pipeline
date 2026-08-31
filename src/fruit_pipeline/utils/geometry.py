@@ -1,4 +1,4 @@
-"""Shared box-geometry helpers used by both ``merge.py`` and ``eval/metrics.py``.
+"""Shared box-geometry helpers used by detection and evaluation.
 
 Boxes are always ``[x1, y1, x2, y2]`` in the same coordinate space (pixels),
 as plain sequences of 4 floats unless a function explicitly takes a numpy

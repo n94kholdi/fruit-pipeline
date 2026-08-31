@@ -24,7 +24,7 @@ import numpy as np
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-from fruit_pipeline.geometry import box_area, iou_xyxy
+from fruit_pipeline.utils.geometry import box_area, iou_xyxy
 
 ALL_BUCKET = "all"
 

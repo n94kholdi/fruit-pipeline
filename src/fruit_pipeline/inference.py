@@ -1,8 +1,8 @@
 """Run Ultralytics inference on complete images without SAHI tiling.
 
 Examples:
-    python inference.py --image data/example.jpg --weights models/best.pt
-    python inference.py --image data/images --weights models/best.pt --conf-threshold 0.4
+    python -m fruit_pipeline.inference --image data/example.jpg --weights models/best.pt
+    python -m fruit_pipeline.inference --image data/images --weights models/best.pt --conf-threshold 0.4
 """
 
 from __future__ import annotations
@@ -11,10 +11,7 @@ import argparse
 import json
 from pathlib import Path
 
-try:  # Supports both ``python inference.py`` and ``python -m fruit_pipeline.inference``.
-    from fruit_pipeline.paths import resolve_model_path
-except ModuleNotFoundError:
-    from paths import resolve_model_path
+from fruit_pipeline.utils.paths import resolve_model_path
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}

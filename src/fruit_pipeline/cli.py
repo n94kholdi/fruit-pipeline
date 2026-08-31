@@ -6,9 +6,9 @@ import argparse
 import logging
 from pathlib import Path
 
-from fruit_pipeline.detectors import YOLOE_MODES
+from fruit_pipeline.detection.backends import YOLOE_MODES
 from fruit_pipeline.pipeline import PipelineConfig, load_models, run_pipeline
-from fruit_pipeline.segment import SAM_MODEL_TYPES
+from fruit_pipeline.segmentation.sam import SAM_MODEL_TYPES
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -77,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help="YAML of attribute-rich text prompts for --detector yolo-world or --yoloe-mode text (default: "
-        "configs/prompts/default.yaml). See that file for the format: a 'fruit' class with descriptive prompts "
+        "the packaged prompt config). The format uses a 'fruit' class with descriptive prompts "
         "('a round orange citrus fruit' rather than just 'orange') plus an optional 'background' class whose "
         "matches are dropped before merging, absorbing non-fruit regions instead of misclassifying them as "
         "fruit. Ignored if --prompt-classes is set (legacy override, no background split).",
@@ -200,7 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="IOU",
         help="Overlap metric used ONLY by the legacy --merge-strategy nmm/greedy_nmm (SAHI's own match metric). "
         "seam-aware/nms use --nms-metric instead. IOS can over-merge distinct, touching fruit into one unioned "
-        "box on a dense crate photo (see merge.py); switch to IOS only if under-merging (duplicate detections "
+        "box on a dense crate photo (see detection/merging.py); switch to IOS only if under-merging (duplicate detections "
         "of the same fruit) turns out to be the bigger problem for your images.",
     )
     merge.add_argument("--merge-iou-threshold", type=float, default=0.5, help="Overlap threshold to merge/suppress two boxes.")
