@@ -23,7 +23,7 @@ detection are separate future stages — see "Next stages" below.
 ## How it works
 
 ```
-detect.py     SAHI slices the image into tiles, runs an Ultralytics detector
+detect.py     SAHI slices the image into tiles, runs an Ultralytics or RF-DETR detector
               on each tile + one full-image pass, shifts boxes back to
               original coordinates. No merging happens here — it logs the
               raw (pre-merge) detection count for debugging.
@@ -55,6 +55,7 @@ pip install -r requirements.txt
 | Model | Used for | Where this project already has it |
 |---|---|---|
 | A standard Ultralytics YOLO checkpoint (`yolo11x.pt`, `yolov8x.pt`, `models/yolo11m.pt`, `models/yolov8m.pt`, ...) | tiled object-like-region detector (class-agnostic) | project root / `models/` |
+| RF-DETR Base (`rf-detr-base.pth`) | optional native RF-DETR tiled detector | `models/rf-detr-base.pth` |
 | SAM ViT-L checkpoint (`sam_vit_l_0b3195.pth`) | box-prompted segmentation | `models/sam_vit_l_0b3195.pth` |
 
 Defaults (`--detector-weights yolo11x.pt`, `--sam-checkpoint
@@ -89,6 +90,30 @@ python -m fruit_pipeline.cli --image path/to/image.jpg --output_dir ./out
 Produces `out/<stem>_detections.json`, `out/<stem>_final.png`, and
 `out/<stem>_tiles.png`, and prints the total fruit count to the console.
 
+### Tiled RF-DETR inference
+
+Install RF-DETR once, then select its backend and checkpoint. The rest of
+the pipeline remains the same: adaptive or fixed tiling, cross-tile merging,
+and SAM box-prompted segmentation.
+
+```bash
+python -m pip install rfdetr
+
+python -m fruit_pipeline.cli \
+  --image path/to/image.jpg \
+  --output_dir outputs/rfdetr_tiled \
+  --detector rfdetr \
+  --detector-weights models/rf-detr-base.pth \
+  --tile-size 640 \
+  --overlap-ratio 0.15 \
+  --conf-threshold 0.25 \
+  --device auto
+```
+
+Omit `--tile-size 640` to use the pipeline's adaptive tile-size pre-pass.
+Keep the default full-image pass, or add `--no-standard-pred` to run tiles
+only.
+
 ### Whole-image detector inference (no tiling)
 
 To inspect the detector's predictions on the complete image without SAHI,
@@ -104,6 +129,25 @@ python inference.py \
 
 `--image` may also be a directory (processed non-recursively). For every
 input, this writes `<stem>_prediction.jpg` and `<stem>_detections.json`.
+
+For the RF-DETR label-free cluster-collapse diagnostic, add the sweep flag.
+This still uses only single-pass full-image inference; it does not enter the
+tiled pipeline or apply NMS/merge logic:
+
+```bash
+python inference.py \
+  --image data/test_fruits_HD \
+  --weights models/rf-detr-base.pth \
+  --backend rfdetr \
+  --rfdetr-diagnostic-sweep \
+  --max-rfdetr-resolution 1120 \
+  --output-dir outputs/rf-detr/diagnostic_sweep
+```
+
+The command writes one `rfdetr_diagnostics.csv`, `verdict.md`, and matching
+`overlays/before` / `overlays/after` images for the ten worst baseline cases.
+Resolution increments default to the runtime model's
+`patch_size * num_windows` divisor (56 for RF-DETR Base) and stop on OOM.
 
 ### Batch mode (a folder of images)
 

@@ -7,7 +7,7 @@ follow-up (network download of a yoloe*.pt checkpoint) rather than run here.
 import numpy as np
 import pytest
 
-from fruit_pipeline.detectors import YoloeBackend, load_detector_backend
+from fruit_pipeline.detectors import RfdetrBackend, YoloeBackend, load_detector_backend
 
 
 class _FakeModel:
@@ -110,3 +110,38 @@ def test_results_to_predictions_visual_mode_keeps_everything():
 def test_load_detector_backend_unknown_name_raises():
     with pytest.raises(ValueError):
         load_detector_backend("bogus", "weights.pt")
+
+
+class _FakeRfdetrDetections:
+    xyxy = np.array([[1, 2, 11, 22], [-2, -3, 500, 600], [4, 4, 4, 8]], dtype=float)
+    confidence = np.array([0.9, 0.8, 0.7], dtype=float)
+    class_id = np.array([1, 2, 3], dtype=int)
+
+    def __len__(self):
+        return len(self.xyxy)
+
+
+class _FakeRfdetrModel:
+    class_names = {1: "apple", 2: "orange", 3: "banana"}
+
+    def __init__(self):
+        self.calls = []
+
+    def predict(self, image, threshold):
+        self.calls.append((image, threshold))
+        return _FakeRfdetrDetections()
+
+
+def test_rfdetr_backend_converts_clamps_and_shifts_predictions():
+    model = _FakeRfdetrModel()
+    backend = RfdetrBackend(model)
+    tile = np.zeros((100, 200, 3), dtype=np.uint8)
+
+    predictions = backend.detect(tile, shift=(10, 20), full_shape=(150, 180), conf_threshold=0.35)
+
+    assert model.calls == [(tile, 0.35)]
+    assert len(predictions) == 2  # Degenerate third box is dropped.
+    assert predictions[0].bbox.to_xyxy() == [11.0, 22.0, 21.0, 42.0]
+    assert predictions[0].category.id == 1
+    assert predictions[0].category.name == "apple"
+    assert predictions[1].bbox.to_xyxy() == [10.0, 20.0, 180.0, 120.0]

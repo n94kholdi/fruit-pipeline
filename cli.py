@@ -34,19 +34,21 @@ def build_parser() -> argparse.ArgumentParser:
     detector.add_argument(
         "--detector-weights",
         default="models/yolo11x.pt",
-        help="Ultralytics detector checkpoint (default: models/yolo11x.pt). Bare filenames like yolo11x.pt "
-        "are resolved under models/. Use a *-world.pt checkpoint with --detector yolo-world, or a "
+        help="Ultralytics or RF-DETR detector checkpoint (default: models/yolo11x.pt). Bare filenames "
+        "are resolved under models/. Use an rf-detr-*.pth checkpoint with --detector rfdetr. "
+        "Use a *-world.pt checkpoint with --detector yolo-world, or a "
         "yoloe*.pt checkpoint (a *-seg-pf.pt variant for --yoloe-mode prompt_free) with --detector yoloe.",
     )
     detector.add_argument(
         "--detector",
-        choices=["default", "yolo-world", "yoloe"],
+        choices=["default", "yolo-world", "yoloe", "rfdetr"],
         default="default",
         help="Detector backend (default: 'default' -- plain class-agnostic detector). 'yolo-world': open-vocab "
         "text prompting via YOLO-World (requires the ultralytics CLIP extra, auto-installed on first use, "
         "~350MB text-encoder download). 'yoloe': native Ultralytics YOLOE (ICCV 2025) -- see --yoloe-mode for "
         "its text/visual/prompt_free prompt modes, e.g. --yoloe-mode visual for the citrus-pile case where "
-        "text prompts draw one giant box around a pile instead of individual fruit.",
+        "text prompts draw one giant box around a pile instead of individual fruit. 'rfdetr': native RF-DETR "
+        "detection on every tile using --detector-weights.",
     )
     detector.add_argument(
         "--use-yolo-world",

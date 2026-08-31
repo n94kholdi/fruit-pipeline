@@ -1,4 +1,4 @@
-"""Detector backend abstraction: one interface, three implementations.
+"""Detector backend abstraction: one interface, four implementations.
 
 Tiling (``detect.py``) and merging (``merge.py``) only ever talk to a
 ``DetectorBackend``'s ``detect()`` method, which always returns
@@ -14,6 +14,9 @@ neither of those stages needs to change no matter which backend runs.
   kwargs), calling ``ultralytics.YOLOE.predict()`` directly per tile and
   building ``ObjectPrediction``s by hand, shifted into full-image
   coordinates itself.
+- ``RfdetrBackend``: native RF-DETR inference on each RGB tile, converting
+  its ``supervision.Detections`` into shifted SAHI predictions so the same
+  tiling, merging, and segmentation stages can consume them.
 
 Visual-prompt mode is genuinely cross-image: a user-supplied exemplar crop
 (``--visual-prompt path/to/crop.png``, one tight crop of a single instance)
@@ -190,6 +193,86 @@ class YoloeBackend(DetectorBackend):
         return predictions
 
 
+class RfdetrBackend(DetectorBackend):
+    """Native RF-DETR prediction adapted to the pipeline's tile interface."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def detect(self, tile_rgb, shift, full_shape, conf_threshold):
+        shift_x, shift_y = shift
+        tile_height, tile_width = tile_rgb.shape[:2]
+        full_height, full_width = full_shape
+        detections = self.model.predict(tile_rgb, threshold=conf_threshold)
+        if detections is None or len(detections) == 0:
+            return []
+
+        class_names = getattr(self.model, "class_names", None)
+        predictions: list[ObjectPrediction] = []
+        for box, score, class_idx in zip(detections.xyxy, detections.confidence, detections.class_id):
+            class_idx = int(class_idx)
+            x1, y1, x2, y2 = (float(value) for value in box)
+            # RF-DETR normally returns in-bounds boxes, but clamping protects
+            # SAHI and downstream crops from small floating-point overshoots.
+            x1, x2 = max(0.0, x1), min(float(tile_width), x2)
+            y1, y2 = max(0.0, y1), min(float(tile_height), y2)
+            x1, x2 = min(float(full_width), x1 + shift_x), min(float(full_width), x2 + shift_x)
+            y1, y2 = min(float(full_height), y1 + shift_y), min(float(full_height), y2 + shift_y)
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            if isinstance(class_names, dict):
+                category_name = class_names.get(class_idx, class_names.get(str(class_idx), str(class_idx)))
+            elif class_names is not None and 0 <= class_idx < len(class_names):
+                category_name = class_names[class_idx]
+            else:
+                category_name = str(class_idx)
+
+            predictions.append(
+                ObjectPrediction(
+                    bbox=[x1, y1, x2, y2],
+                    category_id=class_idx,
+                    category_name=str(category_name),
+                    score=float(score),
+                    shift_amount=[0, 0],
+                )
+            )
+        return predictions
+
+
+def _load_rfdetr_model(weights_path: str, device: str):
+    """Load a detection variant from a canonical RF-DETR checkpoint name."""
+    try:
+        import rfdetr
+    except ImportError as exc:
+        raise RuntimeError(
+            "RF-DETR inference requires the 'rfdetr' package. "
+            "Install it with: python -m pip install rfdetr"
+        ) from exc
+
+    name = weights_path.rsplit("/", 1)[-1].lower()
+    variants = (
+        ("nano", "RFDETRNano"),
+        ("small", "RFDETRSmall"),
+        ("medium", "RFDETRMedium"),
+        ("large", "RFDETRLarge"),
+        ("base", "RFDETRBase"),
+    )
+    for marker, class_name in variants:
+        if marker in name:
+            model_class = getattr(rfdetr, class_name, None)
+            if model_class is None:
+                raise RuntimeError(f"Installed rfdetr package does not provide {class_name}")
+            return model_class(pretrain_weights=weights_path, device=device)
+
+    model_class = getattr(rfdetr, "RFDETR", None)
+    if model_class is not None and hasattr(model_class, "from_checkpoint"):
+        return model_class.from_checkpoint(weights_path, device=device)
+    raise ValueError(
+        "Could not infer the RF-DETR variant from the checkpoint filename. "
+        "Use a canonical name such as rf-detr-base.pth."
+    )
+
 def _build_sahi_detection_model(
     weights_path: str,
     device: str,
@@ -226,8 +309,8 @@ def load_detector_backend(
 
     Args:
         detector: ``"default"`` (plain, class-agnostic), ``"yolo-world"``,
-            or ``"yoloe"``.
-        weights_path: Ultralytics checkpoint path.
+            ``"yoloe"``, or ``"rfdetr"``.
+        weights_path: Ultralytics or RF-DETR checkpoint path.
         fruit_prompts / background_prompts: text prompt lists (see
             ``prompts.PromptConfig``) — used by ``yolo-world`` and
             ``yoloe`` text mode. ``background_prompts`` detections are
@@ -262,7 +345,12 @@ def load_detector_backend(
             visual_prompt_paths=visual_prompt_paths,
         )
 
-    raise ValueError(f"Unknown --detector '{detector}', expected one of ('default', 'yolo-world', 'yoloe')")
+    if detector == "rfdetr":
+        return RfdetrBackend(_load_rfdetr_model(weights_path, device))
+
+    raise ValueError(
+        f"Unknown --detector '{detector}', expected one of ('default', 'yolo-world', 'yoloe', 'rfdetr')"
+    )
 
 
 def _relabel_class_agnostic(predictions: list[ObjectPrediction], label: str = "fruit") -> None:

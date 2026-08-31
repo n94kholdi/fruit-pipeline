@@ -29,7 +29,7 @@ class PipelineConfig:
 
     # Detection
     detector_weights: str = "models/yolo11x.pt"
-    detector: str = "default"  # "default" | "yolo-world" | "yoloe"
+    detector: str = "default"  # "default" | "yolo-world" | "yoloe" | "rfdetr"
     use_yolo_world: bool = False  # deprecated: equivalent to detector="yolo-world", kept for old callers
     prompt_classes: list[str] | None = None  # legacy override; if set, wins over prompt_config (no background split)
     prompt_config: str | None = None  # path to a prompts.PromptConfig YAML; defaults to configs/prompts/default.yaml
