@@ -285,6 +285,27 @@ batch.
   detector's box is; a loose box (covering part of a neighboring fruit) can
   make SAM bleed the mask into the neighbor.
 
+## Running command
+
+```
+python -m fruit_pipeline.cli \                        
+  --image data/test_fruits_HD \
+  --output_dir outputs/yolo/adaptive_gpu_test \
+  --detector-weights models/yolo11x.pt \
+  --sam-checkpoint models/sam_vit_l_0b3195.pth \
+  --device cuda:0 \
+  --sam-batch-size 1 \
+  --tile-size-k 8 \
+  --min-tile-size 320 \
+  --max-tile-size 2048 \
+  --max-tiles 12 \
+  --overlap-ratio 0.15 \
+  --nms-metric diou \
+  --merge-iou-threshold 0.5 \
+  --containment-threshold 0 \
+  --conf-threshold 0.05 \
+  -v
+```
 ## Next stages (not implemented here)
 
 Classification (fruit type), sizing, and rotten/fine detection are meant to
