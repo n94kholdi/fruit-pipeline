@@ -17,8 +17,9 @@ with the image's filename stem — no per-image subfolders):
 - `<stem>_detections.json` with box, score, and mask polygon per fruit, each
   keyed by a stable `instance_id`
 
-It intentionally stops there. Classification, sizing, and rotten/fine
-detection are separate future stages — see "Next stages" below.
+Physical sizing is available as a separate, opt-in calibrated stage. It is
+not run by normal detection/segmentation inference and measures only the
+fruit projection on the pallet plane (not fruit height or 3D volume).
 
 ## Project structure
 
@@ -29,6 +30,10 @@ src/fruit_pipeline/
 ├── visualization/   final overlays and tile-debug rendering
 ├── config/          prompt loading and packaged YAML defaults
 ├── eval/            COCO adapters, metrics, and evaluation CLI
+├── camera_calibration/ standalone checkerboard/ChArUco calibration + store
+├── pallet_geometry/ four-keypoint detector interface, config, and homography
+├── measurement/     mask contour transformation and physical measurements
+├── size_estimation/ calibrated downstream sizing orchestration
 ├── utils/           shared geometry and path helpers
 ├── pipeline.py      end-to-end orchestration for one image
 ├── cli.py           full-pipeline command
@@ -96,6 +101,47 @@ python -m fruit_pipeline.cli --image path/to/image.jpg --output_dir ./out
 
 Produces `out/<stem>_detections.json`, `out/<stem>_final.png`, and
 `out/<stem>_tiles.png`, and prints the total fruit count to the console.
+
+## Calibrated fruit sizing
+
+For the complete, evolving workflow—including image capture, calibration
+commands and output locations, pallet-model TODOs, homography parameters, and
+size-estimation integration—see the
+[camera calibration and fruit sizing tutorial](docs/calibration/README.md).
+
+Calibrate each camera independently from a folder, video, camera device, or
+RTSP source. For a 9x6 checkerboard (inner-corner counts) with 25 mm squares:
+
+```bash
+python calibrate_camera.py \
+  --camera-id cam_001 \
+  --camera-group camera_model_A \
+  --images calibration/cam_001/ \
+  --columns 9 --rows 6 --square-size-mm 25
+```
+
+Use `--board charuco --marker-size-mm 18` for ChArUco. A shared calibration
+can be saved with `--save-as-group`; loading always checks
+`calibrations/cameras/<camera_id>.json` first, then
+`calibrations/groups/<camera_group>.json`. Missing calibration, mismatched
+resolution, excessive reprojection error, malformed pallet corners,
+degenerate homographies, and low-confidence pallet detections fail clearly.
+Video, RTSP, and camera-device inputs sample every tenth frame by default and
+stop after 100 samples; tune these with `--frame-step` and
+`--max-sampled-frames`.
+
+Pallet sizes are independent of calibration; see `config/pallet_types.yaml`.
+The replaceable `PalletDetector` interface must return four labelled keypoints
+in `top-left, top-right, bottom-right, bottom-left` order. Construct
+`SizeEstimationPipeline` with that detector and pass it the existing
+`FruitInstance` masks. In debug mode its result includes a corner/mask/size
+overlay and a rectified pallet image, and `result.save(...)` writes those plus
+the millimetre measurements JSON.
+
+Length and width come from a rotated minimum-area rectangle after every mask
+contour point has been undistorted and transformed to pallet-local millimetres.
+Area and equivalent diameter are likewise planar projected measurements. No
+single global `mm_per_pixel` scale is used.
 
 ### Whole-image detector inference (no tiling)
 

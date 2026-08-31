@@ -1,0 +1,7 @@
+pallet_types:
+  standard_large:
+    width_mm: 1200
+    length_mm: 1800
+  standard_small:
+    width_mm: 1000
+    length_mm: 1200
