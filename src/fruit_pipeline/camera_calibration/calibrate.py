@@ -108,6 +108,61 @@ def _charuco_board(spec: BoardSpec):
     return board, dictionary
 
 
+def _aruco_detector_parameters():
+    if hasattr(cv2.aruco, "DetectorParameters"):
+        parameters = cv2.aruco.DetectorParameters()
+    else:  # OpenCV 4.6 and earlier
+        parameters = cv2.aruco.DetectorParameters_create()
+    if hasattr(parameters, "detectInvertedMarker"):
+        # Some ChArUco generators print markers with inverted polarity.
+        # Enabling this retains detection of ordinary markers as well.
+        parameters.detectInvertedMarker = True
+    return parameters
+
+
+def _modern_charuco_detection(gray: np.ndarray, board, parameters):
+    detector = cv2.aruco.CharucoDetector(board)
+    detector.setDetectorParameters(parameters)
+    return detector.detectBoard(gray)
+
+
+def _detect_charuco(gray: np.ndarray, spec: BoardSpec):
+    """Return the board plus all marker and ChArUco detection outputs."""
+    board, dictionary = _charuco_board(spec)
+    parameters = _aruco_detector_parameters()
+    if hasattr(cv2.aruco, "CharucoDetector"):
+        # OpenCV 4.7+ introduced the object-oriented detector API, and OpenCV
+        # 5 removed the legacy detectMarkers/interpolateCornersCharuco
+        # functions altogether.
+        charuco_corners, charuco_ids, marker_corners, marker_ids = _modern_charuco_detection(
+            gray, board, parameters
+        )
+    else:  # OpenCV 4.6 and earlier
+        marker_corners, marker_ids, _ = cv2.aruco.detectMarkers(
+            gray, dictionary, parameters=parameters
+        )
+        charuco_corners = charuco_ids = None
+        if marker_ids is not None and len(marker_ids) >= 2:
+            _, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
+                marker_corners, marker_ids, gray, board
+            )
+
+    # OpenCV 4.6 changed ChArUco generation for boards with an even number of
+    # rows. Automatically retry the pre-4.6 layout so existing printed boards
+    # continue to work without a separate CLI setting.
+    if (charuco_ids is None or len(charuco_ids) < 6) and hasattr(board, "setLegacyPattern"):
+        board.setLegacyPattern(True)
+        if hasattr(cv2.aruco, "CharucoDetector"):
+            charuco_corners, charuco_ids, marker_corners, marker_ids = _modern_charuco_detection(
+                gray, board, parameters
+            )
+        elif marker_ids is not None and len(marker_ids) >= 2:
+            _, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
+                marker_corners, marker_ids, gray, board
+            )
+    return board, charuco_corners, charuco_ids, marker_corners, marker_ids
+
+
 def detect_board(frame: np.ndarray, spec: BoardSpec) -> tuple[np.ndarray, np.ndarray] | None:
     """Return matching Nx3 board and Nx2 image points for one valid frame."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -127,18 +182,70 @@ def detect_board(frame: np.ndarray, spec: BoardSpec) -> tuple[np.ndarray, np.nda
             return None
         return _checkerboard_object_points(spec), corners.reshape(-1, 2).astype(np.float32)
 
-    board, dictionary = _charuco_board(spec)
-    marker_corners, marker_ids, _ = cv2.aruco.detectMarkers(gray, dictionary)
+    board, charuco_corners, charuco_ids, marker_corners, marker_ids = _detect_charuco(gray, spec)
     if marker_ids is None or len(marker_ids) < 2:
         return None
-    count, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
-        marker_corners, marker_ids, gray, board
-    )
-    if charuco_ids is None or count < 6:
+    if charuco_ids is None or len(charuco_ids) < 6:
         return None
     board_points = board.getChessboardCorners() if hasattr(board, "getChessboardCorners") else board.chessboardCorners
     object_points = np.asarray(board_points, dtype=np.float32)[charuco_ids.reshape(-1)]
     return object_points, charuco_corners.reshape(-1, 2).astype(np.float32)
+
+
+def annotate_board_detection(frame: np.ndarray, spec: BoardSpec) -> tuple[np.ndarray, bool]:
+    """Draw detected markers/corners and return the annotated image and validity."""
+    annotated = frame.copy()
+    if spec.kind == "checkerboard":
+        observation = detect_board(frame, spec)
+        valid = observation is not None
+        corner_count = 0
+        if observation is not None:
+            _, image_points = observation
+            corner_count = len(image_points)
+            cv2.drawChessboardCorners(
+                annotated, (spec.columns, spec.rows), image_points.reshape(-1, 1, 2), True
+            )
+        status = f"VALID - {corner_count} checkerboard corners" if valid else "INVALID - board not detected"
+    else:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, charuco_corners, charuco_ids, marker_corners, marker_ids = _detect_charuco(gray, spec)
+        marker_count = 0 if marker_ids is None else len(marker_ids)
+        corner_count = 0 if charuco_ids is None else len(charuco_ids)
+        if marker_count:
+            cv2.aruco.drawDetectedMarkers(annotated, marker_corners, marker_ids)
+        if corner_count:
+            cv2.aruco.drawDetectedCornersCharuco(
+                annotated, charuco_corners.reshape(-1, 1, 2), charuco_ids.reshape(-1, 1)
+            )
+        valid = marker_count >= 2 and corner_count >= 6
+        status = (
+            f"{'VALID' if valid else 'INVALID'} - {marker_count} ArUco markers, "
+            f"{corner_count} ChArUco corners"
+        )
+
+    color = (40, 180, 40) if valid else (30, 30, 220)
+    cv2.rectangle(annotated, (0, 0), (min(annotated.shape[1], 650), 42), (0, 0, 0), -1)
+    cv2.putText(annotated, status, (12, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+    return annotated, valid
+
+
+def save_detection_outputs(
+    frames: Iterable[tuple[str, np.ndarray]], spec: BoardSpec, output_dir: str | Path,
+) -> Iterator[tuple[str, np.ndarray]]:
+    """Save a detection overlay for every frame while passing frames through."""
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    total = valid_count = 0
+    for index, (label, frame) in enumerate(frames, start=1):
+        annotated, valid = annotate_board_detection(frame, spec)
+        source_stem = Path(label.split("#", 1)[0]).stem or "frame"
+        output_path = destination / f"{index:04d}_{source_stem}_aruco.jpg"
+        if not cv2.imwrite(str(output_path), annotated):
+            raise CalibrationError(f"Could not write detection output: {output_path}")
+        total += 1
+        valid_count += int(valid)
+        yield label, frame
+    logger.info("Saved %d detection overlays (%d valid) to %s", total, valid_count, destination)
 
 
 def _calibrate(
@@ -218,6 +325,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-group")
     parser.add_argument("--images", "--source", dest="source", required=True, help="Folder, image, video, camera index, or RTSP URL")
     parser.add_argument("--output-dir", default="calibrations")
+    parser.add_argument(
+        "--detection-output-dir",
+        help="Save an annotated marker/corner detection image for every sampled input frame",
+    )
     parser.add_argument("--save-as-group", action="store_true", help="Save as shared group calibration instead of camera-specific")
     parser.add_argument("--board", choices=["checkerboard", "charuco"], default="checkerboard")
     parser.add_argument("--columns", type=int, default=9, help="Checkerboard inner corners, or ChArUco squares, horizontally")
@@ -241,8 +352,11 @@ def main() -> None:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
     board = BoardSpec(args.board, args.columns, args.rows, args.square_size_mm, args.marker_size_mm, args.dictionary)
     try:
+        frames = iter_frames(args.source, args.frame_step, args.max_sampled_frames)
+        if args.detection_output_dir:
+            frames = save_detection_outputs(frames, board, args.detection_output_dir)
         calibration = calibrate_camera(
-            iter_frames(args.source, args.frame_step, args.max_sampled_frames),
+            frames,
             args.camera_id, board, args.camera_group,
             args.min_frames, args.max_reprojection_error,
         )

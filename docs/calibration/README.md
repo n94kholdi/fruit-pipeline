@@ -101,14 +101,31 @@ dictionary and physical marker size must match the printed board.
 python calibrate_camera.py \
   --camera-id cam_001 \
   --camera-group camera_model_A \
-  --images calibration/cam_001/ \
+  --images data/calibration/cam_001/ \
   --board charuco \
-  --columns 9 \
-  --rows 6 \
-  --square-size-mm 25 \
-  --marker-size-mm 18 \
-  --dictionary DICT_4X4_50 \
-  --output-dir calibrations
+  --columns 11 \
+  --rows 8 \
+  --square-size-mm 20 \
+  --marker-size-mm 15 \
+  --dictionary DICT_5X5_50 \
+  --output-dir outputs/calibrations/cam_001/ \
+  --max-reprojection-error 2.5
+```
+
+To save a visual detection overlay for every input image, add
+`--detection-output-dir`. Each output shows ArUco marker outlines and IDs,
+interpolated ChArUco corners, and a green `VALID` or red `INVALID` status:
+
+```bash
+python calibrate_camera.py \
+  --camera-id cam_001 \
+  --images data/calibration/cam_001/images \
+  --board charuco \
+  --columns 11 --rows 8 \
+  --square-size-mm 20 --marker-size-mm 15 \
+  --dictionary DICT_5X5_50 \
+  --output-dir outputs/calibrations/cam_001 \
+  --detection-output-dir outputs/calibration_detections/cam_001
 ```
 
 ### Video, camera device, or RTSP stream
