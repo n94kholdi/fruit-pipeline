@@ -5,3 +5,6 @@ pallet_types:
   standard_small:
     width_mm: 1000
     length_mm: 1200
+  calibration_board:
+    width_mm: 220
+    length_mm: 160

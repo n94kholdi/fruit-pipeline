@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -54,3 +56,61 @@ class PalletDetector(Protocol):
 
     def detect(self, image_bgr: np.ndarray) -> PalletDetection | None:
         ...
+
+
+class ManualPalletDetector:
+    """Pallet provider backed by user-selected or previously saved corners.
+
+    It intentionally implements the same ``PalletDetector`` protocol as a
+    future keypoint model.  Consumers therefore do not need a manual-mode
+    branch when the source of the corners changes.
+    """
+
+    def __init__(
+        self,
+        corners_px: np.ndarray,
+        pallet_type: str,
+        *,
+        image_resolution: tuple[int, int] | None = None,
+    ) -> None:
+        self._detection = PalletDetection(corners_px, 1.0, pallet_type)
+        self.image_resolution = image_resolution
+
+    def detect(self, image_bgr: np.ndarray) -> PalletDetection:
+        if image_bgr.ndim < 2:
+            raise PalletGeometryError("Image must have at least two dimensions")
+        actual = (int(image_bgr.shape[1]), int(image_bgr.shape[0]))
+        if self.image_resolution is not None and actual != self.image_resolution:
+            raise PalletGeometryError(
+                f"Saved pallet corners are for {self.image_resolution[0]}x"
+                f"{self.image_resolution[1]}, but image is {actual[0]}x{actual[1]}"
+            )
+        return self._detection
+
+    def save(self, path: str | Path) -> Path:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        payload: dict[str, object] = {
+            "source": "manual",
+            "corner_order": ["top_left", "top_right", "bottom_right", "bottom_left"],
+            "pallet_type": self._detection.pallet_type,
+            "confidence": self._detection.confidence,
+            "corners_px": self._detection.corners_px.tolist(),
+        }
+        if self.image_resolution is not None:
+            payload["image_resolution"] = list(self.image_resolution)
+        destination.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return destination
+
+    @classmethod
+    def load(cls, path: str | Path) -> "ManualPalletDetector":
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            resolution = payload.get("image_resolution")
+            return cls(
+                np.asarray(payload["corners_px"], dtype=np.float32),
+                str(payload["pallet_type"]),
+                image_resolution=tuple(int(value) for value in resolution) if resolution else None,
+            )
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise PalletGeometryError(f"Invalid manual pallet selection {path}: {exc}") from exc

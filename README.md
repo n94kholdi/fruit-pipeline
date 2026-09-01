@@ -108,6 +108,10 @@ For the complete, evolving workflow—including image capture, calibration
 commands and output locations, pallet-model TODOs, homography parameters, and
 size-estimation integration—see the
 [camera calibration and fruit sizing tutorial](docs/calibration/README.md).
+To validate sizing now with clicked pallet/object points, use the
+[manual pallet-plane size workflow](docs/manual_size_validation.md). The
+manual corner source implements the same `PalletDetector` protocol intended
+for a future keypoint model.
 
 Calibrate each camera independently from a folder, video, camera device, or
 RTSP source. For a 9x6 checkerboard (inner-corner counts) with 25 mm squares:

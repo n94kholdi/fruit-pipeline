@@ -38,6 +38,8 @@ fruit-pipeline = "fruit_pipeline.cli:main"
 fruit-inference = "fruit_pipeline.inference:main"
 fruit-eval = "fruit_pipeline.eval.cli:main"
 calibrate-camera = "fruit_pipeline.camera_calibration.calibrate:main"
+select-pallet-corners = "fruit_pipeline.size_estimation.manual_cli:select_pallet_main"
+measure-pallet-object = "fruit_pipeline.size_estimation.manual_cli:measure_object_main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
