@@ -147,6 +147,57 @@ contour point has been undistorted and transformed to pallet-local millimetres.
 Area and equivalent diameter are likewise planar projected measurements. No
 single global `mm_per_pixel` scale is used.
 
+### Connected counting and sizing pipeline
+
+`fruit-size-pipeline` connects pallet setup, tiled detection, SAM masks, fruit
+counting, and calibrated measurement. Every run asks for the target pallet
+corners in `TL, TR, BR, BL` order, then saves both the corner JSON and a preview
+before loading the inference models. For a headless dashboard, send the same
+four points through `--pallet-points-file`. Add `--reuse-pallet-selection`
+only when intentionally reusing an existing saved selection.
+
+```bash
+fruit-size-pipeline \
+  --image data/frame_001.jpg \
+  --output_dir outputs/sized \
+  --camera-id cam_001 \
+  --calibration-dir calibrations \
+  --pallet-type standard_large
+```
+
+The same command accepts a video. It processes every tenth frame by default;
+change that with `--frame-step` and optionally cap work with `--max-frames`:
+
+```bash
+fruit-size-pipeline \
+  --image data/line.mp4 \
+  --output_dir outputs/line \
+  --camera-id cam_001 \
+  --calibration-dir calibrations \
+  --pallet-type standard_large \
+  --frame-step 10
+```
+
+After detection, only fruit masks with at least 50% of their area inside the
+selected pallet polygon are counted and measured. Change this threshold with
+`--min-pallet-overlap`. The top-level `<source>_summary.json` contains a result
+per sampled frame: `num_fruits` is the selected-region count,
+`full_image_num_fruits` is diagnostic, and `num_measured_fruits` reports
+successful measurements. Each retained fruit includes width, length,
+projected area, and equivalent diameter in millimetres. Video frame artifacts
+are stored under `frames/frame_<index>/`. The future pallet model can replace
+the manual provider through the existing `PalletDetector` interface.
+
+As a temporary compatibility measure, `--resize-to-calibration` normalizes an
+input to the stored calibration resolution before pallet setup and inference.
+It can automatically rotate a landscape 4:3 input to a portrait 3:4
+calibration, then resize it. Use `--input-rotation clockwise` or
+`counterclockwise` when automatic orientation is wrong. The command refuses
+to stretch mismatched aspect ratios. This mode is only geometrically valid
+when the input uses the same camera view, aspect ratio, and crop as the
+calibration; calibration at the actual production resolution remains the
+preferred solution.
+
 ### Whole-image detector inference (no tiling)
 
 To inspect the detector's predictions on the complete image without SAHI,
@@ -356,6 +407,39 @@ python -m fruit_pipeline.cli \
   --conf-threshold 0.05 \
   -v
 ```
+
+# fruit-detect-size-pipline
+
+## Running command
+
+```
+fruit-size-pipeline \                                     
+  --image data/calibration/cam_iphone/samples/pexels-enginakyurt-38571540.jpg \
+  --output_dir outputs/video \
+  --camera-id cam_iphone \
+  --calibration-dir outputs/calibrations/camera_model_A/cam_iphone \
+  --pallet-type standard_large \
+  --max-calibration-error 3.0 \
+  --resize-to-calibration \
+  --frame-step 10 \
+  --min-pallet-overlap 0.5 \
+  --detector-weights models/yolo11x.pt \
+  --sam-checkpoint models/sam_vit_l_0b3195.pth \
+  --device cpu \
+  --sam-batch-size 1 \
+  --tile-size-k 8 \
+  --min-tile-size 320 \
+  --max-tile-size 2048 \
+  --max-tiles 12 \
+  --overlap-ratio 0.15 \
+  --nms-metric diou \
+  --merge-iou-threshold 0.5 \
+  --containment-threshold 0 \
+  --conf-threshold 0.05 \
+  -v
+```
+
+
 ## Next stages (not implemented here)
 
 Classification (fruit type), sizing, and rotten/fine detection are meant to

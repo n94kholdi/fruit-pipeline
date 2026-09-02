@@ -19,7 +19,7 @@ does not estimate fruit height, full 3D shape, or volume.
 | Distortion correction and pallet homography | Implemented | `pallet_geometry/homography.py` |
 | Mask-based planar fruit measurements | Implemented | `measurement/` |
 | Debug overlay and rectified pallet view | Implemented | `size_estimation/pipeline.py` |
-| Size-estimation command-line integration | **TODO** | Currently called from Python |
+| Connected image/video count and size CLI | Implemented | `integrated_pipeline.py`, `integrated_cli.py` |
 | Validation against manually measured fruit | **TODO** | Requires a physical validation dataset |
 
 ## 1. Before calibrating a camera
@@ -353,64 +353,95 @@ fruit instance masks. The size stage then performs:
 1. Load camera-specific calibration, falling back to camera-group calibration.
 2. Verify calibration error and image resolution.
 3. Run the injected pallet keypoint detector.
-4. Look up `width_mm` and `length_mm` for the detected pallet type.
-5. Undistort the pallet corner points.
-6. Compute the image-to-pallet homography.
-7. Extract each fruit's segmentation contour.
-8. Undistort every contour point and transform it into pallet millimetres.
-9. Compute rotated length and width with `cv2.minAreaRect()`.
-10. Compute projected area and equivalent diameter.
-11. Optionally save the debug overlay, rectified pallet, and measurement JSON.
+4. Keep only fruit masks sufficiently inside the selected pallet polygon.
+5. Look up `width_mm` and `length_mm` for the detected pallet type.
+6. Undistort the pallet corner points.
+7. Compute the image-to-pallet homography.
+8. Extract each retained fruit's segmentation contour.
+9. Undistort every contour point and transform it into pallet millimetres.
+10. Compute rotated length and width with `cv2.minAreaRect()`.
+11. Compute projected area and equivalent diameter.
+12. Optionally save the debug overlay, rectified pallet, and measurement JSON.
 
-Until a dedicated size-estimation CLI is added, call it from Python after the
-existing segmentation pipeline:
+The connected CLI performs manual pallet setup before loading the detector and
+SAM models, then passes their fruit masks directly to size estimation:
+
+```bash
+fruit-size-pipeline \
+  --image data/frame_001.jpg \
+  --output_dir outputs/sized \
+  --camera-id cam_001 \
+  --camera-group camera_model_A \
+  --calibration-dir calibrations \
+  --pallet-type standard_large
+```
+
+Select four corners interactively in `TL, TR, BR, BL` order at the start of
+each run. The selection and `pallet_selection_preview.png` are written before
+inference starts. Use `--reuse-pallet-selection` only to opt into loading an
+existing selection; this assumes a fixed camera, resolution, and pallet. A
+dashboard can avoid the OpenCV window by providing a JSON point array with
+`--pallet-points-file`.
+
+The selected polygon is also the measurement region. By default a fruit mask
+must have at least 50% of its pixels inside that polygon to be counted and
+measured; tune this with `--min-pallet-overlap`. Result JSON distinguishes the
+selected-region `num_fruits` from diagnostic `full_image_num_fruits`.
+
+For video, the same command samples every tenth frame by default. Use
+`--frame-step N` to change the interval and `--max-frames N` to cap the number
+of processed samples. Counts are reported per sampled frame because summing
+them represents fruit observations, not unique tracked fruit.
+
+If a temporary input has the same camera view and crop but a proportionally
+larger resolution, add `--resize-to-calibration`. The integration layer rotates
+the input when its transposed aspect ratio matches the calibration, resizes it
+to the stored resolution, and uses that normalized image consistently for
+pallet selection, detection, and sizing. Override orientation with
+`--input-rotation clockwise` or `--input-rotation counterclockwise`. Inputs
+whose aspect ratios still differ are rejected rather than stretched. Capture
+and calibration at the real production resolution should replace this mode
+before production deployment.
+
+The orchestration layer can also be called from Python:
 
 ```python
-import cv2
-
-from fruit_pipeline.pipeline import PipelineConfig, run_pipeline
-from fruit_pipeline.size_estimation import (
-    SizeEstimationConfig,
-    SizeEstimationPipeline,
-)
+from fruit_pipeline import IntegratedFruitSizingPipeline, IntegratedPipelineConfig
+from fruit_pipeline.pipeline import PipelineConfig
+from fruit_pipeline.size_estimation import SizeEstimationConfig
 
 image_path = "data/frame_001.jpg"
-
-fruit_instances = run_pipeline(
-    PipelineConfig(
+config = IntegratedPipelineConfig(
+    detection=PipelineConfig(
         image_path=image_path,
-        output_dir="outputs/segmentation",
-    )
-)
-
-# TODO: replace with the completed four-keypoint model adapter from section 5.
-pallet_detector = ProductionPalletDetector("models/pallet_keypoints.pt")
-
-size_pipeline = SizeEstimationPipeline(
-    SizeEstimationConfig(
+        output_dir="outputs/sized",
+    ),
+    sizing=SizeEstimationConfig(
         camera_id="cam_001",
         camera_group="camera_model_A",
         calibration_dir="calibrations",
         pallet_config_path="config/pallet_types.yaml",
-        min_pallet_confidence=0.5,
-        max_calibration_error=2.0,
         debug=True,
     ),
-    pallet_detector=pallet_detector,
+    pallet_type="standard_large",
+    pallet_selection_path="outputs/sized/pallet_selection.json",
 )
-
-image_bgr = cv2.imread(image_path)
-result = size_pipeline.run(image_bgr, fruit_instances)
-result.save("outputs/size", stem="frame_001")
+result = IntegratedFruitSizingPipeline(config).run(image_path)
+print(result.frames[0].num_fruits)
 ```
 
-The saved files are:
+The image outputs include:
 
 ```text
-outputs/size/
+outputs/sized/
+├── pallet_selection.json
+├── pallet_selection_preview.png
+├── frame_001_detections.json
 ├── frame_001_measurements.json
 ├── frame_001_measurement_debug.png
-└── frame_001_rectified_pallet.png
+├── frame_001_rectified_pallet.png
+├── frame_001_result.json
+└── frame_001_summary.json
 ```
 
 Each fruit measurement contains:

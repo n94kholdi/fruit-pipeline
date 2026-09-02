@@ -35,6 +35,7 @@ fruit_pipeline = ["config/prompts/*.yaml"]
 
 [project.scripts]
 fruit-pipeline = "fruit_pipeline.cli:main"
+fruit-size-pipeline = "fruit_pipeline.integrated_cli:main"
 fruit-inference = "fruit_pipeline.inference:main"
 fruit-eval = "fruit_pipeline.eval.cli:main"
 calibrate-camera = "fruit_pipeline.camera_calibration.calibrate:main"
