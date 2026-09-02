@@ -6,6 +6,7 @@ __pycache__
 benchmarks
 data
 eval
+models
 outputs
 tests
 *.egg-info

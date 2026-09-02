@@ -258,8 +258,17 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: Path) -> None:
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, object]:
+    detector_exists = Path(DETECTOR_WEIGHTS).is_file()
+    sam_exists = Path(SAM_CHECKPOINT).is_file()
+    return {
+        "status": "ok",
+        "models_ready": detector_exists and sam_exists,
+        "models": {
+            "detector": detector_exists,
+            "sam": sam_exists,
+        },
+    }
 
 
 @app.get("/api/v1/pallet-types")
@@ -360,6 +369,14 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
         CalibrationStore(CALIBRATION_DIR).load(camera_id)
     except CalibrationError as exc:
         raise HTTPException(404, str(exc)) from exc
+    missing_models = [
+        path for path in (DETECTOR_WEIGHTS, SAM_CHECKPOINT) if not Path(path).is_file()
+    ]
+    if missing_models:
+        raise HTTPException(
+            503,
+            "Required model files are not mounted: " + ", ".join(missing_models),
+        )
     request.camera_id = camera_id
     job_id = uuid.uuid4().hex
     _write_job(job_id, kind="fruit_analysis", status="queued", camera_id=camera_id)

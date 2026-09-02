@@ -9,8 +9,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/src \
     FRUIT_PIPELINE_DATA_DIR=/app/output/dashboard \
     FRUIT_PIPELINE_PALLET_CONFIG=/app/config/pallet_types.yaml \
-    FRUIT_PIPELINE_DETECTOR_WEIGHTS=/app/models/yolo11x.pt \
-    FRUIT_PIPELINE_SAM_CHECKPOINT=/app/models/sam_vit_l_0b3195.pth
+    FRUIT_PIPELINE_DETECTOR_WEIGHTS=/models/yolo11x.pt \
+    FRUIT_PIPELINE_SAM_CHECKPOINT=/models/sam_vit_l_0b3195.pth
 
 WORKDIR /app
 
@@ -21,7 +21,6 @@ RUN apt-get update \
 COPY pyproject.toml README.md ./
 RUN python -m pip install --no-cache-dir ".[api]"
 
-COPY models/yolo11x.pt models/sam_vit_l_0b3195.pth ./models/
 COPY config ./config
 COPY src ./src
 

@@ -452,10 +452,18 @@ uvicorn fruit_pipeline.dashboard_api:app --host 0.0.0.0 --port 8010
 The API accepts calibration captures asynchronously, stores camera calibration
 JSON under `FRUIT_PIPELINE_DATA_DIR`, prepares the first image/video frame for
 four-corner pallet selection, and runs `fruit-size-pipeline` as a background
-job. `Dockerfile` packages the same API for CI/CD. It expects
-`models/yolo11x.pt` and `models/sam_vit_l_0b3195.pth`; the GitHub Actions
-workflow obtains `fruit-models.tgz` from the `v1.0-models` release or the
-`FRUIT_PIPELINE_WEIGHTS_URL` repository secret.
+job. `Dockerfile` packages the same API for CI/CD without embedding model
+weights. At deployment time, mount a host directory at `/models` containing:
+
+```text
+yolo11x.pt
+sam_vit_l_0b3195.pth
+```
+
+The container reads them from `/models/yolo11x.pt` and
+`/models/sam_vit_l_0b3195.pth`. The `/health` response reports
+`models_ready: true` after both files are mounted. This keeps the container
+image small and means GitHub Actions does not upload or download model files.
 
 ## Next stages (not implemented here)
 

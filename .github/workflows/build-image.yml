@@ -35,25 +35,9 @@ jobs:
     if: github.event_name != 'pull_request'
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download inference weights
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WEIGHTS_URL: ${{ secrets.FRUIT_PIPELINE_WEIGHTS_URL }}
-        run: |
-          set -euo pipefail
-          mkdir -p models
-          if [[ -n "${WEIGHTS_URL:-}" ]]; then
-            curl -fsSL "$WEIGHTS_URL" -o /tmp/fruit-models.tgz
-          else
-            gh release download v1.0-models --pattern fruit-models.tgz --dir /tmp
-          fi
-          tar -xzf /tmp/fruit-models.tgz -C .
-          test -f models/yolo11x.pt
-          test -f models/sam_vit_l_0b3195.pth
 
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
