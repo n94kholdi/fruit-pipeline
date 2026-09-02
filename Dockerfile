@@ -19,10 +19,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
+COPY src ./src
 RUN python -m pip install --no-cache-dir ".[api]"
 
 COPY config ./config
-COPY src ./src
 
 RUN useradd --create-home --uid 10001 appuser \
     && mkdir -p /app/output/dashboard \
