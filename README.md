@@ -440,8 +440,24 @@ fruit-size-pipeline \
 ```
 
 
+### Dashboard API and container
+
+Install the API extra and start the calibration/analysis adapter on port 8010:
+
+```bash
+pip install -e '.[api]'
+uvicorn fruit_pipeline.dashboard_api:app --host 0.0.0.0 --port 8010
+```
+
+The API accepts calibration captures asynchronously, stores camera calibration
+JSON under `FRUIT_PIPELINE_DATA_DIR`, prepares the first image/video frame for
+four-corner pallet selection, and runs `fruit-size-pipeline` as a background
+job. `Dockerfile` packages the same API for CI/CD. It expects
+`models/yolo11x.pt` and `models/sam_vit_l_0b3195.pth`; the GitHub Actions
+workflow obtains `fruit-models.tgz` from the `v1.0-models` release or the
+`FRUIT_PIPELINE_WEIGHTS_URL` repository secret.
+
 ## Next stages (not implemented here)
 
-Classification (fruit type), sizing, and rotten/fine detection are meant to
-be separate modules that consume `detections.json` from this stage, joining
-on each record's `instance_id`. Nothing here needs to change to add them.
+Fruit-type classification and rotten/fine quality detection can be added as
+separate modules that join on each result's `instance_id`.

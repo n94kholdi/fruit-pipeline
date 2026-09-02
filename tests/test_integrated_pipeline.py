@@ -87,6 +87,7 @@ def test_image_pipeline_selects_pallet_before_models_and_returns_sizes(tmp_path)
     assert frame["full_image_num_fruits"] == 1
     assert frame["num_measured_fruits"] == 1
     assert frame["fruits"][0]["size"]["width_mm"] == 20.0
+    assert result.to_dict()["average_fruit_size_mm"]["width"] == 20.0
     assert (tmp_path / "output/fruit_summary.json").is_file()
     assert (tmp_path / "output/fruit_result.json").is_file()
 

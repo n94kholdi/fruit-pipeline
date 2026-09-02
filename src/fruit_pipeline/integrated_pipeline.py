@@ -99,12 +99,30 @@ class MediaResult:
         """Fruit count for an image, or the sum across sampled video frames."""
         return sum(frame.num_fruits for frame in self.frames)
 
+    @property
+    def average_size_mm(self) -> dict[str, float] | None:
+        measurements = [
+            measurement
+            for frame in self.frames
+            for measurement in frame.sizing.measurements
+        ]
+        if not measurements:
+            return None
+        return {
+            "width": float(np.mean([item.width_mm for item in measurements])),
+            "length": float(np.mean([item.length_mm for item in measurements])),
+            "equivalent_diameter": float(
+                np.mean([item.equivalent_diameter_mm for item in measurements])
+            ),
+        }
+
     def to_dict(self) -> dict[str, object]:
         return {
             "source": self.source,
             "pallet_selection_path": self.pallet_selection_path,
             "processed_frame_count": len(self.frames),
             "total_fruit_observations": self.num_fruits,
+            "average_fruit_size_mm": self.average_size_mm,
             "frames": [frame.to_dict() for frame in self.frames],
         }
 

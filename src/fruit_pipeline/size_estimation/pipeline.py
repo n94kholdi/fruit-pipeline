@@ -148,7 +148,11 @@ def _draw_debug(
             continue
         contour = extract_primary_contour(fruit.mask).astype(np.int32)
         cv2.polylines(canvas, [contour], True, (255, 120, 0), 2, cv2.LINE_AA)
-        center = tuple(np.round(contour.mean(axis=0)).astype(int))
+        if hasattr(fruit, "box") and len(fruit.box) == 4:
+            x1, y1, x2, y2 = (float(value) for value in fruit.box)
+            center = (round((x1 + x2) / 2), round((y1 + y2) / 2))
+        else:
+            center = tuple(np.round(contour.mean(axis=0)).astype(int))
         text = f"{measurement.length_mm:.1f} x {measurement.width_mm:.1f} mm"
         cv2.putText(canvas, text, center, cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(canvas, text, center, cv2.FONT_HERSHEY_SIMPLEX, 0.45, (30, 30, 30), 1, cv2.LINE_AA)
