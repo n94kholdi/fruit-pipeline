@@ -40,6 +40,7 @@ SAM_CHECKPOINT = os.getenv("FRUIT_PIPELINE_SAM_CHECKPOINT", "models/sam_vit_l_0b
 DEVICE = os.getenv("FRUIT_PIPELINE_DEVICE", "cpu")
 MAX_UPLOAD_BYTES = int(os.getenv("FRUIT_PIPELINE_MAX_UPLOAD_BYTES", str(1024**3)))
 WORKERS = max(1, int(os.getenv("FRUIT_PIPELINE_JOB_WORKERS", "1")))
+MAX_CAPTURED_CALIBRATION_FRAMES = 300
 
 for directory in (CALIBRATION_DIR, INPUT_DIR, JOB_DIR):
     directory.mkdir(parents=True, exist_ok=True)
@@ -84,6 +85,22 @@ class StreamInputRequest(BaseModel):
     camera_id: str
     stream_url: str
     allow_unsafe_resize: bool = False
+
+
+class StreamCalibrationRequest(BaseModel):
+    camera_id: str
+    stream_url: str
+    camera_group: str | None = None
+    board: Literal["checkerboard", "charuco"] = "charuco"
+    columns: int = Field(default=11, ge=2)
+    rows: int = Field(default=8, ge=2)
+    square_size_mm: float = Field(default=20, gt=0)
+    marker_size_mm: float = Field(default=15, gt=0)
+    dictionary: str = "DICT_5X5_50"
+    frame_step: int = Field(default=10, ge=1)
+    min_frames: int = Field(default=8, ge=3)
+    max_reprojection_error: float = Field(default=2.5, gt=0)
+    capture_seconds: int = Field(default=30, ge=5, le=120)
 
 
 def _safe_name(value: str, label: str) -> str:
@@ -194,6 +211,73 @@ def _run_calibration(
             error=None,
         )
     except Exception as exc:  # worker boundary: expose a useful failed state
+        _write_job(job_id, status="failed", error=str(exc))
+
+
+def _capture_calibration_frames(
+    stream_url: str,
+    destination: Path,
+    capture_seconds: int,
+    frame_step: int,
+) -> int:
+    """Capture sampled stream frames for a bounded calibration recording."""
+    destination.mkdir(parents=True, exist_ok=True)
+    capture = cv2.VideoCapture(stream_url)
+    if not capture.isOpened():
+        capture.release()
+        raise CalibrationError("Could not open the camera stream for calibration capture")
+
+    started = time.monotonic()
+    frame_index = 0
+    saved = 0
+    try:
+        while time.monotonic() - started < capture_seconds:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                break
+            if frame_index % frame_step == 0 and saved < MAX_CAPTURED_CALIBRATION_FRAMES:
+                path = destination / f"{saved:04d}.jpg"
+                if not cv2.imwrite(str(path), frame):
+                    raise CalibrationError(f"Could not save calibration frame: {path}")
+                saved += 1
+            frame_index += 1
+    finally:
+        capture.release()
+
+    if saved == 0:
+        raise CalibrationError("The camera stream ended before any calibration frames were captured")
+    return saved
+
+
+def _run_stream_calibration(
+    job_id: str,
+    camera_id: str,
+    camera_group: str | None,
+    stream_url: str,
+    board: BoardSpec,
+    frame_step: int,
+    min_frames: int,
+    max_error: float,
+    capture_seconds: int,
+) -> None:
+    capture_dir = JOB_DIR / job_id / "captures"
+    try:
+        _write_job(
+            job_id,
+            status="capturing",
+            capture_seconds=capture_seconds,
+        )
+        captured_frames = _capture_calibration_frames(
+            stream_url, capture_dir, capture_seconds, frame_step,
+        )
+        _write_job(job_id, captured_frames=captured_frames)
+        # Directories are consumed as already-sampled images by the existing
+        # calibration command, keeping upload and live capture behavior aligned.
+        _run_calibration(
+            job_id, camera_id, camera_group, capture_dir, board,
+            1, min_frames, max_error,
+        )
+    except Exception as exc:  # worker boundary: never expose stream credentials
         _write_job(job_id, status="failed", error=str(exc))
 
 
@@ -388,6 +472,46 @@ def create_calibration(
     executor.submit(
         _run_calibration, job_id, camera_id, camera_group, source, board_spec,
         frame_step, min_frames, max_reprojection_error,
+    )
+    return {"data": _job(job_id)}
+
+
+@app.post("/api/v1/calibrations/from-stream", status_code=202)
+def create_stream_calibration(request: StreamCalibrationRequest) -> dict[str, object]:
+    camera_id = _safe_name(request.camera_id, "camera id")
+    camera_group = _safe_name(request.camera_group, "camera group") if request.camera_group else None
+    parsed_url = urlsplit(request.stream_url)
+    if parsed_url.scheme.lower() not in {"rtsp", "rtsps", "http", "https"} or not parsed_url.netloc:
+        raise HTTPException(422, "A valid RTSP or HTTP camera stream URL is required")
+
+    board_spec = BoardSpec(
+        request.board,
+        request.columns,
+        request.rows,
+        request.square_size_mm,
+        request.marker_size_mm,
+        request.dictionary,
+    )
+    job_id = uuid.uuid4().hex
+    _write_job(
+        job_id,
+        kind="calibration",
+        source_type="stream",
+        status="queued",
+        camera_id=camera_id,
+        capture_seconds=request.capture_seconds,
+    )
+    executor.submit(
+        _run_stream_calibration,
+        job_id,
+        camera_id,
+        camera_group,
+        request.stream_url,
+        board_spec,
+        request.frame_step,
+        request.min_frames,
+        request.max_reprojection_error,
+        request.capture_seconds,
     )
     return {"data": _job(job_id)}
 

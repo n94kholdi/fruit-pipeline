@@ -112,6 +112,63 @@ def test_create_stream_input_captures_normalized_preview_and_keeps_source_privat
     assert "stream_url" not in response["data"]
 
 
+def test_create_stream_calibration_queues_private_stream_capture(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_api, "JOB_DIR", tmp_path / "jobs")
+    submitted = []
+    monkeypatch.setattr(
+        dashboard_api,
+        "executor",
+        SimpleNamespace(submit=lambda *args: submitted.append(args)),
+    )
+    with dashboard_api.jobs_lock:
+        dashboard_api.jobs.clear()
+
+    response = dashboard_api.create_stream_calibration(
+        dashboard_api.StreamCalibrationRequest(
+            camera_id="camera-01",
+            stream_url="rtsp://user:secret@mediamtx:8554/camera-01",
+            capture_seconds=20,
+        )
+    )
+
+    record = response["data"]
+    assert record["status"] == "queued"
+    assert record["source_type"] == "stream"
+    assert record["capture_seconds"] == 20
+    assert submitted[0][0] is dashboard_api._run_stream_calibration
+    persisted = (tmp_path / "jobs" / record["id"] / "job.json").read_text(encoding="utf-8")
+    assert "user:secret" not in persisted
+
+
+def test_capture_calibration_frames_samples_a_bounded_stream(tmp_path, monkeypatch):
+    frame = np.zeros((12, 16, 3), np.uint8)
+
+    class FakeCapture:
+        released = False
+
+        def isOpened(self):
+            return True
+
+        def read(self):
+            return True, frame
+
+        def release(self):
+            self.released = True
+
+    capture = FakeCapture()
+    times = iter([0.0, 0.0, 1.0, 2.0, 6.0])
+    monkeypatch.setattr(dashboard_api.cv2, "VideoCapture", lambda _url: capture)
+    monkeypatch.setattr(dashboard_api.time, "monotonic", lambda: next(times))
+
+    count = dashboard_api._capture_calibration_frames(
+        "rtsp://camera/live", tmp_path / "captures", capture_seconds=5, frame_step=2,
+    )
+
+    assert count == 2
+    assert capture.released is True
+    assert sorted(path.name for path in (tmp_path / "captures").iterdir()) == ["0000.jpg", "0001.jpg"]
+
+
 def test_cancel_queued_fruit_job_marks_it_cancelled(tmp_path, monkeypatch):
     monkeypatch.setattr(dashboard_api, "JOB_DIR", tmp_path)
     with dashboard_api.jobs_lock:
