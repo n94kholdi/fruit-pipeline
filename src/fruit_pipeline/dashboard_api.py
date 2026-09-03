@@ -8,22 +8,24 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Iterator, Literal
 
 import cv2
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from fruit_pipeline.camera_calibration.calibrate import BoardSpec
 from fruit_pipeline.camera_calibration.calibration_store import CalibrationStore
 from fruit_pipeline.camera_calibration.models import CalibrationError
 from fruit_pipeline.integrated_pipeline import normalize_to_resolution
+from fruit_pipeline.live import FruitLiveReporter
 from fruit_pipeline.pallet_geometry.pallet_config import PalletTypeConfig
 
 
@@ -99,7 +101,7 @@ def _job(job_id: str) -> dict[str, object]:
     with jobs_lock:
         record = jobs.get(job_id)
     if record is not None:
-        return dict(record)
+        return _with_live_state(job_id, dict(record))
     path = JOB_DIR / job_id / "job.json"
     if path.is_file():
         try:
@@ -108,6 +110,17 @@ def _job(job_id: str) -> dict[str, object]:
             record = None
     if record is None:
         raise HTTPException(404, "Job not found")
+    return _with_live_state(job_id, record)
+
+
+def _with_live_state(job_id: str, record: dict[str, object]) -> dict[str, object]:
+    path = JOB_DIR / job_id / "live_state.json"
+    try:
+        live = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        live = None
+    if isinstance(live, dict):
+        record["live"] = live
     return record
 
 
@@ -209,6 +222,13 @@ def _result_payload(job_id: str, output_dir: Path, source: Path) -> dict[str, ob
 
 def _run_fruit_job(job_id: str, request: FruitJobRequest, source: Path) -> None:
     _write_job(job_id, status="running")
+    job_dir = JOB_DIR / job_id
+    reporter = FruitLiveReporter(job_dir, job_id)
+    reporter.emit(
+        "job_started",
+        status="running",
+        message="Loading detection and segmentation models.",
+    )
     output_dir = JOB_DIR / job_id / "results"
     points_path = JOB_DIR / job_id / "pallet_points.json"
     points_path.write_text(
@@ -240,6 +260,8 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: Path) -> None:
         "--merge-iou-threshold", "0.5",
         "--containment-threshold", "0",
         "--conf-threshold", "0.05",
+        "--live-job-dir", str(job_dir),
+        "--live-job-id", job_id,
         "-v",
     ]
     if request.resize_to_calibration:
@@ -256,8 +278,10 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: Path) -> None:
             raise RuntimeError(log[-4000:] or f"Pipeline exited with code {completed.returncode}")
         result = _result_payload(job_id, output_dir, source)
         _write_job(job_id, status="completed", result=result, error=None)
+        reporter.emit("job_completed", status="completed", progress=100.0)
     except Exception as exc:
         _write_job(job_id, status="failed", error=str(exc))
+        reporter.emit("job_failed", status="failed", message=str(exc))
 
 
 @app.get("/health")
@@ -397,6 +421,119 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
 @app.get("/api/v1/jobs/{job_id}")
 def get_job(job_id: str) -> dict[str, object]:
     return {"data": _job(_safe_name(job_id, "job id"))}
+
+
+@app.get("/api/v1/jobs/{job_id}/events")
+def stream_job_events(
+    job_id: str,
+    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
+    after: Annotated[int | None, Query(ge=0)] = None,
+) -> StreamingResponse:
+    job_id = _safe_name(job_id, "job id")
+    _job(job_id)
+    cursor = after or 0
+    if last_event_id and last_event_id.isdigit():
+        cursor = max(cursor, int(last_event_id))
+    return StreamingResponse(
+        _event_stream(job_id, cursor),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/v1/jobs/{job_id}/preview")
+def job_preview(job_id: str) -> FileResponse:
+    job_id = _safe_name(job_id, "job id")
+    _job(job_id)
+    path = JOB_DIR / job_id / "preview.jpg"
+    if not path.is_file():
+        raise HTTPException(404, "Fruit preview not available yet")
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/v1/jobs/{job_id}/preview-stream")
+def job_preview_stream(job_id: str) -> StreamingResponse:
+    job_id = _safe_name(job_id, "job id")
+    _job(job_id)
+    return StreamingResponse(
+        _preview_stream(job_id),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+def _event_stream(job_id: str, cursor: int) -> Iterator[str]:
+    """Tail live job events with resumable SSE line-number identifiers."""
+
+    idle_started = time.monotonic()
+    stream = None
+    line_number = 0
+    terminal_seen_at: float | None = None
+    try:
+        while True:
+            record = _job(job_id)
+            path = JOB_DIR / job_id / "events.jsonl"
+            if stream is None and path.is_file():
+                try:
+                    stream = path.open("r", encoding="utf-8")
+                    while line_number < cursor and stream.readline():
+                        line_number += 1
+                except OSError:
+                    stream = None
+            line = stream.readline() if stream is not None else ""
+            if line:
+                line_number += 1
+                try:
+                    event_type = str(json.loads(line).get("type", "message"))
+                except (json.JSONDecodeError, AttributeError):
+                    event_type = "message"
+                yield f"id: {line_number}\nevent: {event_type}\ndata: {line.rstrip()}\n\n"
+                idle_started = time.monotonic()
+                continue
+            if record.get("status") in {"completed", "failed"}:
+                terminal_seen_at = terminal_seen_at or time.monotonic()
+                if time.monotonic() - terminal_seen_at >= 0.5:
+                    return
+            else:
+                terminal_seen_at = None
+            if time.monotonic() - idle_started >= 15.0:
+                yield ": keep-alive\n\n"
+                idle_started = time.monotonic()
+            time.sleep(0.25)
+    finally:
+        if stream is not None:
+            stream.close()
+
+
+def _preview_stream(job_id: str) -> Iterator[bytes]:
+    """Stream each completed annotated JPEG while retaining the last frame."""
+
+    last_modified = -1
+    terminal_seen_at: float | None = None
+    while True:
+        record = _job(job_id)
+        preview = JOB_DIR / job_id / "preview.jpg"
+        try:
+            modified = preview.stat().st_mtime_ns
+            if modified != last_modified:
+                image = preview.read_bytes()
+                last_modified = modified
+                yield (
+                    b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(image)).encode("ascii")
+                    + b"\r\n\r\n"
+                    + image
+                    + b"\r\n"
+                )
+        except OSError:
+            pass
+        if record.get("status") in {"completed", "failed"}:
+            terminal_seen_at = terminal_seen_at or time.monotonic()
+            if time.monotonic() - terminal_seen_at >= 1.0:
+                return
+        else:
+            terminal_seen_at = None
+        time.sleep(0.05)
 
 
 @app.get("/api/v1/jobs/{job_id}/artifacts/{artifact_path:path}")

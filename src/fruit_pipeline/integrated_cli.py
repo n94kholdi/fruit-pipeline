@@ -12,6 +12,7 @@ from fruit_pipeline.integrated_pipeline import (
     IntegratedFruitSizingPipeline,
     IntegratedPipelineConfig,
 )
+from fruit_pipeline.live import FruitLiveReporter
 from fruit_pipeline.size_estimation.pipeline import SizeEstimationConfig
 
 
@@ -112,6 +113,9 @@ def build_parser():
         type=int,
         help="Optional maximum number of sampled video frames to process.",
     )
+    live = parser.add_argument_group("dashboard live reporting")
+    live.add_argument("--live-job-dir", help="Dashboard job directory for live events and preview.")
+    live.add_argument("--live-job-id", help="Dashboard job identifier used in live events.")
     return parser
 
 
@@ -157,7 +161,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         reuse_pallet_selection=args.reuse_pallet_selection,
         min_pallet_overlap=args.min_pallet_overlap,
     )
-    result = IntegratedFruitSizingPipeline(config).run(source)
+    reporter = None
+    if args.live_job_dir or args.live_job_id:
+        if not args.live_job_dir or not args.live_job_id:
+            parser.error("--live-job-dir and --live-job-id must be provided together")
+        reporter = FruitLiveReporter(args.live_job_dir, args.live_job_id)
+
+    def publish_frame(frame_result, preview, processed_count, total_count):
+        if reporter is None:
+            return
+        reporter.publish_frame(
+            preview,
+            frame_index=frame_result.frame_index,
+            timestamp_ms=frame_result.timestamp_ms,
+            processed_frame_count=processed_count,
+            total_sampled_frames=total_count,
+            num_fruits=frame_result.num_fruits,
+            num_measured_fruits=len(frame_result.sizing.measurements),
+        )
+
+    result = IntegratedFruitSizingPipeline(
+        config,
+        frame_processed=publish_frame if reporter is not None else None,
+    ).run(source)
     summary_path = output_dir / f"{source.stem}_summary.json"
     print(
         f"Processed {len(result.frames)} frame(s); "

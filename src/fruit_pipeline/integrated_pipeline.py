@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 PALLET_CORNER_LABELS = ("TL", "TR", "BR", "BL")
 INPUT_ROTATIONS = ("auto", "none", "clockwise", "counterclockwise", "180")
+FrameProcessedCallback = Callable[["FrameResult", np.ndarray, int, int | None], None]
 
 
 @dataclass(frozen=True)
@@ -183,6 +184,7 @@ class IntegratedFruitSizingPipeline:
         sam_predictor=None,
         model_loader: Callable[[PipelineConfig], tuple[object, object]] = load_models,
         detection_runner: Callable[..., list[FruitInstance]] = run_pipeline,
+        frame_processed: FrameProcessedCallback | None = None,
     ) -> None:
         if config.frame_step <= 0:
             raise ValueError("frame_step must be positive")
@@ -203,6 +205,7 @@ class IntegratedFruitSizingPipeline:
         self.sam_predictor = sam_predictor
         self._model_loader = model_loader
         self._detection_runner = detection_runner
+        self._frame_processed = frame_processed
         self._sizing_pipeline: SizeEstimationPipeline | None = None
         self._calibration_resolution: tuple[int, int] | None = None
 
@@ -301,6 +304,7 @@ class IntegratedFruitSizingPipeline:
             None,
             Path(self.config.detection.output_dir),
         )
+        self._notify_frame(frame, image, 1, 1)
         result = MediaResult(str(path), str(self.config.pallet_selection_path), [frame])
         result.save(Path(self.config.detection.output_dir) / f"{path.stem}_summary.json")
         return result
@@ -319,6 +323,20 @@ class IntegratedFruitSizingPipeline:
             self.prepare_pallet(self._normalize_frame(first_frame))
             self._ensure_models(str(path))
 
+            raw_frame_count_value = float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            raw_frame_count = (
+                int(raw_frame_count_value)
+                if np.isfinite(raw_frame_count_value) and raw_frame_count_value > 0
+                else 0
+            )
+            total_sampled_frames = (
+                (raw_frame_count + self.config.frame_step - 1) // self.config.frame_step
+                if raw_frame_count > 0
+                else None
+            )
+            if total_sampled_frames is not None and self.config.max_frames is not None:
+                total_sampled_frames = min(total_sampled_frames, self.config.max_frames)
+
             frame_index = 0
             frame = first_frame
             ok = True
@@ -334,14 +352,19 @@ class IntegratedFruitSizingPipeline:
                     frame_path = artifact_dir / f"{path.stem}_frame_{frame_index:06d}.jpg"
                     if not cv2.imwrite(str(frame_path), processing_frame):
                         raise OSError(f"Cannot write sampled frame: {frame_path}")
-                    frames.append(
-                        self._process_frame(
-                            processing_frame,
-                            frame_path,
-                            frame_index,
-                            _finite_float_or_none(capture.get(cv2.CAP_PROP_POS_MSEC)),
-                            artifact_dir,
-                        )
+                    frame_result = self._process_frame(
+                        processing_frame,
+                        frame_path,
+                        frame_index,
+                        _finite_float_or_none(capture.get(cv2.CAP_PROP_POS_MSEC)),
+                        artifact_dir,
+                    )
+                    frames.append(frame_result)
+                    self._notify_frame(
+                        frame_result,
+                        processing_frame,
+                        len(frames),
+                        total_sampled_frames,
                     )
                     if self.config.max_frames is not None and len(frames) >= self.config.max_frames:
                         break
@@ -353,6 +376,26 @@ class IntegratedFruitSizingPipeline:
         result = MediaResult(str(path), str(self.config.pallet_selection_path), frames)
         result.save(Path(self.config.detection.output_dir) / f"{path.stem}_summary.json")
         return result
+
+    def _notify_frame(
+        self,
+        result: FrameResult,
+        source_frame: np.ndarray,
+        processed_frame_count: int,
+        total_sampled_frames: int | None,
+    ) -> None:
+        if self._frame_processed is None:
+            return
+        preview = result.sizing.debug_overlay
+        try:
+            self._frame_processed(
+                result,
+                preview if preview is not None else source_frame,
+                processed_frame_count,
+                total_sampled_frames,
+            )
+        except Exception:
+            logger.exception("Could not publish live preview for processed frame")
 
     def _normalize_frame(self, image_bgr: np.ndarray) -> np.ndarray:
         if not self.config.resize_to_calibration:

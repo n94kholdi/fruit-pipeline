@@ -97,6 +97,7 @@ def test_video_pipeline_processes_every_tenth_frame(tmp_path, monkeypatch):
     video_path.touch()
     config = _config(tmp_path, video_path, frame_step=10)
     frames = [np.zeros((240, 160, 3), np.uint8) for _ in range(25)]
+    published = []
 
     class FakeCapture:
         def __init__(self, _path):
@@ -115,7 +116,9 @@ def test_video_pipeline_processes_every_tenth_frame(tmp_path, monkeypatch):
             self.index += 1
             return True, frame
 
-        def get(self, _property):
+        def get(self, property_id):
+            if property_id == cv2.CAP_PROP_FRAME_COUNT:
+                return len(frames)
             return self.last_read * 40.0
 
         def release(self):
@@ -126,10 +129,18 @@ def test_video_pipeline_processes_every_tenth_frame(tmp_path, monkeypatch):
         config,
         model_loader=lambda _config: (object(), object()),
         detection_runner=_fake_detection_runner,
+        frame_processed=lambda result, preview, processed, total: published.append(
+            (result.frame_index, preview.shape, processed, total)
+        ),
     ).run(video_path)
 
     assert [frame.frame_index for frame in result.frames] == [0, 10, 20]
     assert [frame.num_fruits for frame in result.frames] == [1, 1, 1]
+    assert published == [
+        (0, (240, 160, 3), 1, 3),
+        (10, (240, 160, 3), 2, 3),
+        (20, (240, 160, 3), 3, 3),
+    ]
     assert (tmp_path / "output/fruit_summary.json").is_file()
     assert (tmp_path / "output/frames/frame_000020/fruit_frame_000020_result.json").is_file()
 

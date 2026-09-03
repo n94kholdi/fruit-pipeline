@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 
 from fruit_pipeline import dashboard_api
+from fruit_pipeline.live import FruitLiveReporter
 
 
 def test_result_payload_exposes_average_and_overlay(tmp_path, monkeypatch):
@@ -35,3 +36,49 @@ def test_safe_name_rejects_path_segments():
 
     with pytest.raises(HTTPException):
         dashboard_api._safe_name("../camera", "camera id")
+
+
+def test_job_polling_includes_latest_live_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_api, "JOB_DIR", tmp_path)
+    with dashboard_api.jobs_lock:
+        dashboard_api.jobs.clear()
+    dashboard_api._write_job("job-live", status="running")
+    reporter = FruitLiveReporter(tmp_path / "job-live", "job-live")
+    reporter.publish_frame(
+        np.zeros((20, 20, 3), np.uint8),
+        frame_index=10,
+        timestamp_ms=400.0,
+        processed_frame_count=2,
+        total_sampled_frames=5,
+        num_fruits=3,
+        num_measured_fruits=2,
+    )
+
+    record = dashboard_api._job("job-live")
+
+    assert record["live"]["frame_index"] == 10
+    assert record["live"]["progress"] == 40.0
+
+
+def test_preview_and_event_streams_expose_persisted_updates(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_api, "JOB_DIR", tmp_path)
+    with dashboard_api.jobs_lock:
+        dashboard_api.jobs.clear()
+    dashboard_api._write_job("job-stream", status="completed")
+    reporter = FruitLiveReporter(tmp_path / "job-stream", "job-stream")
+    reporter.publish_frame(
+        np.zeros((20, 20, 3), np.uint8),
+        frame_index=0,
+        timestamp_ms=0.0,
+        processed_frame_count=1,
+        total_sampled_frames=1,
+        num_fruits=1,
+        num_measured_fruits=1,
+    )
+
+    preview_chunk = next(dashboard_api._preview_stream("job-stream"))
+    event_chunk = next(dashboard_api._event_stream("job-stream", 0))
+
+    assert preview_chunk.startswith(b"--frame\r\nContent-Type: image/jpeg")
+    assert "event: preview_updated" in event_chunk
+    assert '"frame_index":0' in event_chunk
