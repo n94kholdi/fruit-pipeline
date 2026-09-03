@@ -160,6 +160,19 @@ def test_temporary_resize_refuses_aspect_ratio_stretching():
         normalize_to_resolution(image, (960, 1280))
 
 
+def test_temporary_resize_can_force_aspect_ratio_for_testing():
+    image = np.zeros((500, 500, 3), np.uint8)
+
+    normalized, rotation = normalize_to_resolution(
+        image,
+        (960, 1280),
+        allow_aspect_mismatch=True,
+    )
+
+    assert normalized.shape[:2] == (1280, 960)
+    assert rotation == "none"
+
+
 def test_fruit_outside_selected_pallet_is_not_counted_or_sized():
     inside_mask = np.zeros((240, 160), dtype=bool)
     inside_mask[40:81, 30:51] = True

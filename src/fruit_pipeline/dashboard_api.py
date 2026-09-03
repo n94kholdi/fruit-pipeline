@@ -70,6 +70,7 @@ class FruitJobRequest(BaseModel):
     frame_step: int = Field(default=10, ge=1)
     min_pallet_overlap: float = Field(default=0.5, ge=0, le=1)
     resize_to_calibration: bool = True
+    allow_unsafe_resize: bool = False
     max_frames: int | None = Field(default=None, ge=1)
 
 
@@ -243,6 +244,8 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: Path) -> None:
     ]
     if request.resize_to_calibration:
         command.append("--resize-to-calibration")
+    if request.allow_unsafe_resize:
+        command.append("--allow-unsafe-resize")
     if request.max_frames is not None:
         command.extend(["--max-frames", str(request.max_frames)])
     try:
@@ -318,6 +321,7 @@ def create_calibration(
 def create_input(
     file: Annotated[UploadFile, File()],
     camera_id: Annotated[str, Form()],
+    allow_unsafe_resize: Annotated[bool, Form()] = False,
 ) -> dict[str, object]:
     camera_id = _safe_name(camera_id, "camera id")
     try:
@@ -330,7 +334,12 @@ def create_input(
     _save_upload(file, source)
     frame = _read_media_first_frame(source)
     try:
-        normalized, _ = normalize_to_resolution(frame, calibration.resolution, rotation="auto")
+        normalized, _ = normalize_to_resolution(
+            frame,
+            calibration.resolution,
+            rotation="auto",
+            allow_aspect_mismatch=allow_unsafe_resize,
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     preview = source.with_name("preview.jpg")
@@ -344,6 +353,7 @@ def create_input(
             "width": normalized.shape[1],
             "height": normalized.shape[0],
             "preview_url": f"/api/v1/inputs/{input_id}/preview",
+            "allow_unsafe_resize": allow_unsafe_resize,
         }
     }
 

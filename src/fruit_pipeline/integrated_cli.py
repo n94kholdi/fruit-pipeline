@@ -93,6 +93,12 @@ def build_parser():
         help="Rotation applied before temporary calibration resizing (default: auto). Auto uses a clockwise "
         "quarter-turn when that matches the calibration aspect ratio better.",
     )
+    sizing.add_argument(
+        "--allow-unsafe-resize",
+        action="store_true",
+        help="Testing only: stretch aspect-mismatched inputs to the calibration resolution. "
+        "Resulting physical measurements are invalid.",
+    )
 
     video = parser.add_argument_group("video sampling")
     video.add_argument(
@@ -146,6 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_frames=args.max_frames,
         max_preview_size=args.max_preview_size,
         resize_to_calibration=args.resize_to_calibration,
+        allow_unsafe_resize=args.allow_unsafe_resize,
         input_rotation=args.input_rotation,
         reuse_pallet_selection=args.reuse_pallet_selection,
         min_pallet_overlap=args.min_pallet_overlap,

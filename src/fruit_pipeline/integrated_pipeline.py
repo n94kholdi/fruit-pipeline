@@ -50,6 +50,7 @@ class IntegratedPipelineConfig:
     max_frames: int | None = None
     max_preview_size: int = 900
     resize_to_calibration: bool = False
+    allow_unsafe_resize: bool = False
     input_rotation: str = "auto"
     reuse_pallet_selection: bool = False
     min_pallet_overlap: float = 0.5
@@ -366,6 +367,7 @@ class IntegratedFruitSizingPipeline:
             image_bgr,
             self._calibration_resolution,
             rotation=self.config.input_rotation,
+            allow_aspect_mismatch=self.config.allow_unsafe_resize,
         )
         if normalized is not image_bgr:
             logger.warning(
@@ -483,6 +485,7 @@ def normalize_to_resolution(
     *,
     rotation: str = "auto",
     aspect_tolerance: float = 0.01,
+    allow_aspect_mismatch: bool = False,
 ) -> tuple[np.ndarray, str]:
     """Rotate and resize an image to a calibration resolution without stretching.
 
@@ -527,11 +530,18 @@ def normalize_to_resolution(
     source_aspect = oriented_width / oriented_height
     target_aspect = target_width / target_height
     relative_aspect_error = abs(source_aspect - target_aspect) / target_aspect
-    if relative_aspect_error > aspect_tolerance:
+    if relative_aspect_error > aspect_tolerance and not allow_aspect_mismatch:
         raise ValueError(
             f"Cannot safely resize {source_width}x{source_height} to calibration resolution "
             f"{target_width}x{target_height}: aspect ratios differ after rotation "
             f"'{applied_rotation}'. Cropping or stretching would invalidate measurements."
+        )
+    if relative_aspect_error > aspect_tolerance:
+        logger.warning(
+            "Unsafe testing resize is stretching aspect ratio from %.4f to %.4f; "
+            "physical measurements are invalid",
+            source_aspect,
+            target_aspect,
         )
     if (oriented_width, oriented_height) == (target_width, target_height):
         return oriented, applied_rotation
