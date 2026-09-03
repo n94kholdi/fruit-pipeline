@@ -11,6 +11,7 @@ from fruit_pipeline.integrated_pipeline import (
     INPUT_ROTATIONS,
     IntegratedFruitSizingPipeline,
     IntegratedPipelineConfig,
+    media_source_stem,
 )
 from fruit_pipeline.live import FruitLiveReporter
 from fruit_pipeline.size_estimation.pipeline import SizeEstimationConfig
@@ -127,8 +128,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    source = Path(args.image)
-    if source.is_dir():
+    source: str | Path = args.image if "://" in args.image else Path(args.image)
+    if isinstance(source, Path) and source.is_dir():
         parser.error("The integrated sizing command accepts one image or video, not a directory")
 
     output_dir = Path(args.output_dir)
@@ -184,7 +185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config,
         frame_processed=publish_frame if reporter is not None else None,
     ).run(source)
-    summary_path = output_dir / f"{source.stem}_summary.json"
+    summary_path = output_dir / f"{media_source_stem(source)}_summary.json"
     print(
         f"Processed {len(result.frames)} frame(s); "
         f"fruit observations: {result.num_fruits}; summary: {summary_path}"

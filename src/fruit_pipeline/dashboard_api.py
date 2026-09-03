@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Iterator, Literal
+from urllib.parse import urlsplit
 
 import cv2
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
@@ -24,7 +25,7 @@ from pydantic import BaseModel, Field
 from fruit_pipeline.camera_calibration.calibrate import BoardSpec
 from fruit_pipeline.camera_calibration.calibration_store import CalibrationStore
 from fruit_pipeline.camera_calibration.models import CalibrationError
-from fruit_pipeline.integrated_pipeline import normalize_to_resolution
+from fruit_pipeline.integrated_pipeline import media_source_stem, normalize_to_resolution
 from fruit_pipeline.live import FruitLiveReporter
 from fruit_pipeline.pallet_geometry.pallet_config import PalletTypeConfig
 
@@ -74,6 +75,12 @@ class FruitJobRequest(BaseModel):
     resize_to_calibration: bool = True
     allow_unsafe_resize: bool = False
     max_frames: int | None = Field(default=None, ge=1)
+
+
+class StreamInputRequest(BaseModel):
+    camera_id: str
+    stream_url: str
+    allow_unsafe_resize: bool = False
 
 
 def _safe_name(value: str, label: str) -> str:
@@ -187,17 +194,18 @@ def _run_calibration(
         _write_job(job_id, status="failed", error=str(exc))
 
 
-def _read_media_first_frame(path: Path):
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+def _read_media_first_frame(source: str | Path):
+    source_text = str(source)
+    image = None if "://" in source_text else cv2.imread(source_text, cv2.IMREAD_COLOR)
     if image is not None:
         return image
-    capture = cv2.VideoCapture(str(path))
+    capture = cv2.VideoCapture(source_text)
     try:
         ok, frame = capture.read()
     finally:
         capture.release()
     if not ok or frame is None:
-        raise HTTPException(422, "Could not read the uploaded image or first video frame")
+        raise HTTPException(422, "Could not read the image, video, or live stream")
     return frame
 
 
@@ -206,9 +214,12 @@ def _artifact_url(job_id: str, path: Path) -> str:
     return f"/api/v1/jobs/{job_id}/artifacts/{relative.as_posix()}"
 
 
-def _result_payload(job_id: str, output_dir: Path, source: Path) -> dict[str, object]:
-    summary_path = output_dir / f"{source.stem}_summary.json"
+def _result_payload(job_id: str, output_dir: Path, source: str | Path) -> dict[str, object]:
+    summary_path = output_dir / f"{media_source_stem(source)}_summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if "://" in str(source):
+        # Do not expose camera credentials that may be embedded in the stream URL.
+        summary["source"] = "live-stream"
     frames = summary.get("frames", [])
     for frame in frames:
         artifact_dir = Path(frame["artifact_dir"])
@@ -220,7 +231,7 @@ def _result_payload(job_id: str, output_dir: Path, source: Path) -> dict[str, ob
     return summary
 
 
-def _run_fruit_job(job_id: str, request: FruitJobRequest, source: Path) -> None:
+def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) -> None:
     _write_job(job_id, status="running")
     job_dir = JOB_DIR / job_id
     reporter = FruitLiveReporter(job_dir, job_id)
@@ -382,6 +393,52 @@ def create_input(
     }
 
 
+@app.post("/api/v1/stream-inputs", status_code=201)
+def create_stream_input(request: StreamInputRequest) -> dict[str, object]:
+    camera_id = _safe_name(request.camera_id, "camera id")
+    parsed_url = urlsplit(request.stream_url)
+    if parsed_url.scheme.lower() not in {"rtsp", "rtsps", "http", "https"} or not parsed_url.netloc:
+        raise HTTPException(422, "A valid RTSP or HTTP camera stream URL is required")
+    try:
+        calibration = CalibrationStore(CALIBRATION_DIR).load(camera_id)
+    except CalibrationError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+    frame = _read_media_first_frame(request.stream_url)
+    try:
+        normalized, _ = normalize_to_resolution(
+            frame,
+            calibration.resolution,
+            rotation="auto",
+            allow_aspect_mismatch=request.allow_unsafe_resize,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    input_id = uuid.uuid4().hex
+    input_dir = INPUT_DIR / input_id
+    input_dir.mkdir(parents=True, exist_ok=True)
+    (input_dir / "stream.json").write_text(
+        json.dumps({"camera_id": camera_id, "stream_url": request.stream_url}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    preview = input_dir / "preview.jpg"
+    if not cv2.imwrite(str(preview), normalized):
+        raise HTTPException(500, "Could not create the pallet selection preview")
+    return {
+        "data": {
+            "id": input_id,
+            "filename": "live-stream",
+            "camera_id": camera_id,
+            "width": normalized.shape[1],
+            "height": normalized.shape[0],
+            "preview_url": f"/api/v1/inputs/{input_id}/preview",
+            "allow_unsafe_resize": request.allow_unsafe_resize,
+            "source_type": "stream",
+        }
+    }
+
+
 @app.get("/api/v1/inputs/{input_id}/preview")
 def input_preview(input_id: str):
     _safe_name(input_id, "input id")
@@ -396,9 +453,23 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
     input_id = _safe_name(request.input_id, "input id")
     camera_id = _safe_name(request.camera_id, "camera id")
     input_folder = INPUT_DIR / input_id
-    sources = [path for path in input_folder.glob("source.*") if path.is_file()]
+    sources: list[str | Path] = [path for path in input_folder.glob("source.*") if path.is_file()]
+    stream_metadata_path = input_folder / "stream.json"
+    source_type = "file"
+    if not sources and stream_metadata_path.is_file():
+        try:
+            stream_metadata = json.loads(stream_metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(500, "Live stream input metadata is invalid") from exc
+        if stream_metadata.get("camera_id") != camera_id:
+            raise HTTPException(409, "The selected calibration does not match the live camera")
+        stream_url = stream_metadata.get("stream_url")
+        if not isinstance(stream_url, str):
+            raise HTTPException(500, "Live stream input metadata is invalid")
+        sources = [stream_url]
+        source_type = "stream"
     if len(sources) != 1:
-        raise HTTPException(404, "Uploaded input not found")
+        raise HTTPException(404, "Uploaded or live input not found")
     try:
         CalibrationStore(CALIBRATION_DIR).load(camera_id)
     except CalibrationError as exc:
@@ -412,8 +483,10 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
             "Required model files are not mounted: " + ", ".join(missing_models),
         )
     request.camera_id = camera_id
+    if source_type == "stream" and request.max_frames is None:
+        request.max_frames = 100
     job_id = uuid.uuid4().hex
-    _write_job(job_id, kind="fruit_analysis", status="queued", camera_id=camera_id)
+    _write_job(job_id, kind="fruit_analysis", source_type=source_type, status="queued", camera_id=camera_id)
     executor.submit(_run_fruit_job, job_id, request, sources[0])
     return {"data": _job(job_id)}
 

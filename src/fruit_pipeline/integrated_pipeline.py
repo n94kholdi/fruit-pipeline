@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
@@ -38,6 +39,15 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 PALLET_CORNER_LABELS = ("TL", "TR", "BR", "BL")
 INPUT_ROTATIONS = ("auto", "none", "clockwise", "counterclockwise", "180")
 FrameProcessedCallback = Callable[["FrameResult", np.ndarray, int, int | None], None]
+
+
+def media_source_stem(source: str | Path) -> str:
+    """Return a filesystem-safe stem for either a local path or stream URL."""
+    text = str(source)
+    if "://" in text:
+        candidate = Path(urlsplit(text).path.rstrip("/")).stem
+        return candidate if candidate and candidate not in {".", ".."} else "live_stream"
+    return Path(text).stem
 
 
 @dataclass(frozen=True)
@@ -276,10 +286,11 @@ class IntegratedFruitSizingPipeline:
         return self.pallet_detector
 
     def run(self, source: str | Path) -> MediaResult:
-        source_path = Path(source)
-        if source_path.suffix.lower() in IMAGE_EXTENSIONS:
+        source_text = str(source)
+        source_path = Path(source_text)
+        if "://" not in source_text and source_path.suffix.lower() in IMAGE_EXTENSIONS:
             return self.run_image(source_path)
-        return self.run_video(source_path)
+        return self.run_video(source_text)
 
     def run_image(self, image_path: str | Path) -> MediaResult:
         path = Path(image_path)
@@ -310,18 +321,19 @@ class IntegratedFruitSizingPipeline:
         return result
 
     def run_video(self, video_path: str | Path) -> MediaResult:
-        path = Path(video_path)
-        capture = cv2.VideoCapture(str(path))
+        source = str(video_path)
+        stem = media_source_stem(source)
+        capture = cv2.VideoCapture(source)
         if not capture.isOpened():
-            raise FileNotFoundError(f"Cannot open video: {path}")
+            raise FileNotFoundError(f"Cannot open video or stream: {source}")
 
         frames: list[FrameResult] = []
         try:
             ok, first_frame = capture.read()
             if not ok or first_frame is None:
-                raise ValueError(f"Video contains no readable frames: {path}")
+                raise ValueError(f"Video or stream contains no readable frames: {source}")
             self.prepare_pallet(self._normalize_frame(first_frame))
-            self._ensure_models(str(path))
+            self._ensure_models(source)
 
             raw_frame_count_value = float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
             raw_frame_count = (
@@ -349,7 +361,7 @@ class IntegratedFruitSizingPipeline:
                         / f"frame_{frame_index:06d}"
                     )
                     artifact_dir.mkdir(parents=True, exist_ok=True)
-                    frame_path = artifact_dir / f"{path.stem}_frame_{frame_index:06d}.jpg"
+                    frame_path = artifact_dir / f"{stem}_frame_{frame_index:06d}.jpg"
                     if not cv2.imwrite(str(frame_path), processing_frame):
                         raise OSError(f"Cannot write sampled frame: {frame_path}")
                     frame_result = self._process_frame(
@@ -373,8 +385,8 @@ class IntegratedFruitSizingPipeline:
         finally:
             capture.release()
 
-        result = MediaResult(str(path), str(self.config.pallet_selection_path), frames)
-        result.save(Path(self.config.detection.output_dir) / f"{path.stem}_summary.json")
+        result = MediaResult(source, str(self.config.pallet_selection_path), frames)
+        result.save(Path(self.config.detection.output_dir) / f"{stem}_summary.json")
         return result
 
     def _notify_frame(

@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -82,3 +83,30 @@ def test_preview_and_event_streams_expose_persisted_updates(tmp_path, monkeypatc
     assert preview_chunk.startswith(b"--frame\r\nContent-Type: image/jpeg")
     assert "event: preview_updated" in event_chunk
     assert '"frame_index":0' in event_chunk
+
+
+def test_create_stream_input_captures_normalized_preview_and_keeps_source_private(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_api, "INPUT_DIR", tmp_path / "inputs")
+    monkeypatch.setattr(
+        dashboard_api.CalibrationStore,
+        "load",
+        lambda _store, _camera_id: SimpleNamespace(resolution=(160, 240)),
+    )
+    monkeypatch.setattr(
+        dashboard_api,
+        "_read_media_first_frame",
+        lambda source: np.zeros((240, 160, 3), np.uint8),
+    )
+
+    response = dashboard_api.create_stream_input(dashboard_api.StreamInputRequest(
+        camera_id="camera-01",
+        stream_url="rtsp://user:secret@mediamtx:8554/camera-01",
+    ))
+
+    input_id = response["data"]["id"]
+    input_dir = tmp_path / "inputs" / input_id
+    assert response["data"]["source_type"] == "stream"
+    assert (input_dir / "preview.jpg").is_file()
+    metadata = (input_dir / "stream.json").read_text(encoding="utf-8")
+    assert "user:secret" in metadata
+    assert "stream_url" not in response["data"]

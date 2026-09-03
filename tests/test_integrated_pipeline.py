@@ -13,6 +13,7 @@ from fruit_pipeline.integrated_pipeline import (
     IntegratedFruitSizingPipeline,
     IntegratedPipelineConfig,
     filter_instances_to_pallet,
+    media_source_stem,
     normalize_to_resolution,
 )
 from fruit_pipeline.pallet_geometry.detector import ManualPalletDetector
@@ -143,6 +144,43 @@ def test_video_pipeline_processes_every_tenth_frame(tmp_path, monkeypatch):
     ]
     assert (tmp_path / "output/fruit_summary.json").is_file()
     assert (tmp_path / "output/frames/frame_000020/fruit_frame_000020_result.json").is_file()
+
+
+def test_live_stream_url_is_preserved_and_uses_safe_artifact_names(tmp_path, monkeypatch):
+    config = replace(_config(tmp_path, tmp_path / "placeholder.mp4"), max_frames=1)
+    stream_url = "rtsp://user:secret@mediamtx:8554/camera-01?token=private"
+    captured_sources = []
+    frame = np.zeros((240, 160, 3), np.uint8)
+
+    class FakeCapture:
+        def __init__(self, source):
+            captured_sources.append(source)
+            self.read_count = 0
+
+        def isOpened(self):
+            return True
+
+        def read(self):
+            self.read_count += 1
+            return (True, frame) if self.read_count == 1 else (False, None)
+
+        def get(self, _property_id):
+            return 0
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr("fruit_pipeline.integrated_pipeline.cv2.VideoCapture", FakeCapture)
+    result = IntegratedFruitSizingPipeline(
+        config,
+        model_loader=lambda _config: (object(), object()),
+        detection_runner=_fake_detection_runner,
+    ).run(stream_url)
+
+    assert captured_sources == [stream_url]
+    assert result.source == stream_url
+    assert media_source_stem(stream_url) == "camera-01"
+    assert (tmp_path / "output/camera-01_summary.json").is_file()
 
 
 def test_temporary_resize_rotates_landscape_input_to_portrait_calibration(tmp_path):
