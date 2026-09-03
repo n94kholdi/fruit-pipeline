@@ -110,3 +110,53 @@ def test_create_stream_input_captures_normalized_preview_and_keeps_source_privat
     metadata = (input_dir / "stream.json").read_text(encoding="utf-8")
     assert "user:secret" in metadata
     assert "stream_url" not in response["data"]
+
+
+def test_cancel_queued_fruit_job_marks_it_cancelled(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_api, "JOB_DIR", tmp_path)
+    with dashboard_api.jobs_lock:
+        dashboard_api.jobs.clear()
+        dashboard_api.job_futures.clear()
+        dashboard_api.job_processes.clear()
+    dashboard_api._write_job(
+        "job-cancel-queued",
+        kind="fruit_analysis",
+        status="queued",
+    )
+    future = SimpleNamespace(cancel=lambda: True)
+    with dashboard_api.jobs_lock:
+        dashboard_api.job_futures["job-cancel-queued"] = future
+
+    response = dashboard_api.cancel_job("job-cancel-queued")
+
+    assert response["data"]["status"] == "cancelled"
+    assert (tmp_path / "job-cancel-queued" / "cancel.requested").is_file()
+    events = (tmp_path / "job-cancel-queued" / "events.jsonl").read_text(encoding="utf-8")
+    assert '"type":"job_cancelled"' in events
+
+
+def test_cancel_running_fruit_job_terminates_process(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_api, "JOB_DIR", tmp_path)
+    with dashboard_api.jobs_lock:
+        dashboard_api.jobs.clear()
+        dashboard_api.job_futures.clear()
+        dashboard_api.job_processes.clear()
+    dashboard_api._write_job(
+        "job-cancel-running",
+        kind="fruit_analysis",
+        status="running",
+    )
+    process = SimpleNamespace(poll=lambda: None, terminate_called=False)
+
+    def terminate():
+        process.terminate_called = True
+
+    process.terminate = terminate
+    with dashboard_api.jobs_lock:
+        dashboard_api.job_processes["job-cancel-running"] = process
+
+    response = dashboard_api.cancel_job("job-cancel-running")
+
+    assert response["data"]["status"] == "cancelling"
+    assert process.terminate_called is True
+    assert (tmp_path / "job-cancel-running" / "cancel.requested").is_file()

@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Iterator, Literal
@@ -57,6 +57,9 @@ app.add_middleware(
 executor = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="fruit-dashboard")
 jobs: dict[str, dict[str, object]] = {}
 jobs_lock = threading.Lock()
+job_futures: dict[str, Future[None]] = {}
+job_processes: dict[str, subprocess.Popen[str]] = {}
+TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
 class Point(BaseModel):
@@ -231,10 +234,24 @@ def _result_payload(job_id: str, output_dir: Path, source: str | Path) -> dict[s
     return summary
 
 
+def _finish_cancelled(job_id: str, reporter: FruitLiveReporter) -> dict[str, object]:
+    record = _write_job(job_id, status="cancelled", error=None)
+    reporter.emit(
+        "job_cancelled",
+        status="cancelled",
+        message="Fruit analysis was cancelled.",
+    )
+    return record
+
+
 def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) -> None:
-    _write_job(job_id, status="running")
     job_dir = JOB_DIR / job_id
     reporter = FruitLiveReporter(job_dir, job_id)
+    cancel_path = job_dir / "cancel.requested"
+    if cancel_path.is_file():
+        _finish_cancelled(job_id, reporter)
+        return
+    _write_job(job_id, status="running")
     reporter.emit(
         "job_started",
         status="running",
@@ -282,17 +299,40 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
     if request.max_frames is not None:
         command.extend(["--max-frames", str(request.max_frames)])
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
-        log = (completed.stdout + "\n" + completed.stderr).strip()
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        with jobs_lock:
+            job_processes[job_id] = process
+        if cancel_path.is_file():
+            process.terminate()
+        stdout, stderr = process.communicate()
+        with jobs_lock:
+            job_processes.pop(job_id, None)
+        log = (stdout + "\n" + stderr).strip()
         (JOB_DIR / job_id / "pipeline.log").write_text(log + "\n", encoding="utf-8")
-        if completed.returncode != 0:
-            raise RuntimeError(log[-4000:] or f"Pipeline exited with code {completed.returncode}")
+        if cancel_path.is_file():
+            _finish_cancelled(job_id, reporter)
+            return
+        if process.returncode != 0:
+            raise RuntimeError(log[-4000:] or f"Pipeline exited with code {process.returncode}")
         result = _result_payload(job_id, output_dir, source)
+        if cancel_path.is_file():
+            _finish_cancelled(job_id, reporter)
+            return
         _write_job(job_id, status="completed", result=result, error=None)
         reporter.emit("job_completed", status="completed", progress=100.0)
     except Exception as exc:
-        _write_job(job_id, status="failed", error=str(exc))
-        reporter.emit("job_failed", status="failed", message=str(exc))
+        with jobs_lock:
+            job_processes.pop(job_id, None)
+        if cancel_path.is_file():
+            _finish_cancelled(job_id, reporter)
+        else:
+            _write_job(job_id, status="failed", error=str(exc))
+            reporter.emit("job_failed", status="failed", message=str(exc))
 
 
 @app.get("/health")
@@ -487,13 +527,56 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
         request.max_frames = 100
     job_id = uuid.uuid4().hex
     _write_job(job_id, kind="fruit_analysis", source_type=source_type, status="queued", camera_id=camera_id)
-    executor.submit(_run_fruit_job, job_id, request, sources[0])
+    future = executor.submit(_run_fruit_job, job_id, request, sources[0])
+    with jobs_lock:
+        job_futures[job_id] = future
     return {"data": _job(job_id)}
 
 
 @app.get("/api/v1/jobs/{job_id}")
 def get_job(job_id: str) -> dict[str, object]:
     return {"data": _job(_safe_name(job_id, "job id"))}
+
+
+@app.post("/api/v1/jobs/{job_id}/cancel", status_code=202)
+def cancel_job(job_id: str) -> dict[str, object]:
+    job_id = _safe_name(job_id, "job id")
+    record = _job(job_id)
+    if record.get("kind") != "fruit_analysis":
+        raise HTTPException(409, "Only fruit-analysis jobs can be cancelled")
+    if record.get("status") in TERMINAL_JOB_STATUSES:
+        return {"data": record}
+
+    job_dir = JOB_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "cancel.requested").touch()
+    reporter = FruitLiveReporter(job_dir, job_id)
+    latest = _job(job_id)
+    if latest.get("status") in TERMINAL_JOB_STATUSES:
+        return {"data": latest}
+    with jobs_lock:
+        future = job_futures.get(job_id)
+        process = job_processes.get(job_id)
+
+    if future is not None and future.cancel():
+        return {"data": _finish_cancelled(job_id, reporter)}
+    if future is None and process is None:
+        # The API may have restarted after persisting an active job. Its child
+        # process no longer exists, so cancellation can be finalized immediately.
+        return {"data": _finish_cancelled(job_id, reporter)}
+
+    record = _write_job(job_id, status="cancelling", error=None)
+    reporter.emit(
+        "warning",
+        status="cancelling",
+        message="Cancellation requested.",
+    )
+    if process is not None and process.poll() is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    return {"data": record}
 
 
 @app.get("/api/v1/jobs/{job_id}/events")
@@ -563,7 +646,7 @@ def _event_stream(job_id: str, cursor: int) -> Iterator[str]:
                 yield f"id: {line_number}\nevent: {event_type}\ndata: {line.rstrip()}\n\n"
                 idle_started = time.monotonic()
                 continue
-            if record.get("status") in {"completed", "failed"}:
+            if record.get("status") in TERMINAL_JOB_STATUSES:
                 terminal_seen_at = terminal_seen_at or time.monotonic()
                 if time.monotonic() - terminal_seen_at >= 0.5:
                     return
@@ -600,7 +683,7 @@ def _preview_stream(job_id: str) -> Iterator[bytes]:
                 )
         except OSError:
             pass
-        if record.get("status") in {"completed", "failed"}:
+        if record.get("status") in TERMINAL_JOB_STATUSES:
             terminal_seen_at = terminal_seen_at or time.monotonic()
             if time.monotonic() - terminal_seen_at >= 1.0:
                 return
