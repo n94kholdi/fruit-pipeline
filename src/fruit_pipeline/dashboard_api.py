@@ -72,6 +72,8 @@ class FruitJobRequest(BaseModel):
     input_id: str
     camera_id: str
     pallet_type: str = "standard_large"
+    pallet_width_mm: float | None = Field(default=None, gt=0)
+    pallet_length_mm: float | None = Field(default=None, gt=0)
     corners: list[Point] = Field(min_length=4, max_length=4)
     max_calibration_error: float = Field(default=3.0, gt=0)
     frame_step: int = Field(default=10, ge=1)
@@ -328,6 +330,44 @@ def _finish_cancelled(job_id: str, reporter: FruitLiveReporter) -> dict[str, obj
     return record
 
 
+def _validate_requested_pallet(request: FruitJobRequest) -> None:
+    custom_dimensions = (request.pallet_width_mm, request.pallet_length_mm)
+    if request.pallet_type == "custom":
+        if any(value is None for value in custom_dimensions):
+            raise HTTPException(422, "Custom pallet width and length are required")
+        return
+    if any(value is not None for value in custom_dimensions):
+        raise HTTPException(422, "Custom dimensions require pallet_type='custom'")
+    try:
+        PalletTypeConfig.load(PALLET_CONFIG).get(request.pallet_type)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _pallet_config_for_job(job_dir: Path, request: FruitJobRequest) -> Path:
+    if request.pallet_type != "custom":
+        return PALLET_CONFIG
+    # The custom dimensions belong to this job only, avoiding mutations of the
+    # shared preset file when several users submit analyses concurrently.
+    destination = job_dir / "pallet_types.json"
+    destination.write_text(
+        json.dumps(
+            {
+                "pallet_types": {
+                    "custom": {
+                        "width_mm": request.pallet_width_mm,
+                        "length_mm": request.pallet_length_mm,
+                    }
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return destination
+
+
 def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) -> None:
     job_dir = JOB_DIR / job_id
     reporter = FruitLiveReporter(job_dir, job_id)
@@ -347,6 +387,7 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
         json.dumps([[point.x, point.y] for point in request.corners], indent=2) + "\n",
         encoding="utf-8",
     )
+    pallet_config = _pallet_config_for_job(job_dir, request)
     command = [
         sys.executable, "-m", "fruit_pipeline.integrated_cli",
         "--image", str(source),
@@ -354,7 +395,7 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
         "--camera-id", request.camera_id,
         "--calibration-dir", str(CALIBRATION_DIR),
         "--pallet-type", request.pallet_type,
-        "--pallet-config", str(PALLET_CONFIG),
+        "--pallet-config", str(pallet_config),
         "--pallet-points-file", str(points_path),
         "--max-calibration-error", str(request.max_calibration_error),
         "--frame-step", str(request.frame_step),
@@ -638,6 +679,7 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
         CalibrationStore(CALIBRATION_DIR).load(camera_id)
     except CalibrationError as exc:
         raise HTTPException(404, str(exc)) from exc
+    _validate_requested_pallet(request)
     missing_models = [
         path for path in (DETECTOR_WEIGHTS, SAM_CHECKPOINT) if not Path(path).is_file()
     ]
@@ -650,7 +692,16 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
     if source_type == "stream" and request.max_frames is None:
         request.max_frames = 100
     job_id = uuid.uuid4().hex
-    _write_job(job_id, kind="fruit_analysis", source_type=source_type, status="queued", camera_id=camera_id)
+    _write_job(
+        job_id,
+        kind="fruit_analysis",
+        source_type=source_type,
+        status="queued",
+        camera_id=camera_id,
+        pallet_type=request.pallet_type,
+        pallet_width_mm=request.pallet_width_mm,
+        pallet_length_mm=request.pallet_length_mm,
+    )
     future = executor.submit(_run_fruit_job, job_id, request, sources[0])
     with jobs_lock:
         job_futures[job_id] = future

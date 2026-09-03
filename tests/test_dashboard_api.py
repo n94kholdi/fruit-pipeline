@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -6,6 +7,49 @@ import numpy as np
 
 from fruit_pipeline import dashboard_api
 from fruit_pipeline.live import FruitLiveReporter
+
+
+def _fruit_job_request(**changes):
+    values = {
+        "input_id": "input-01",
+        "camera_id": "camera-01",
+        "corners": [
+            {"x": 10, "y": 10},
+            {"x": 110, "y": 10},
+            {"x": 110, "y": 210},
+            {"x": 10, "y": 210},
+        ],
+    }
+    values.update(changes)
+    return dashboard_api.FruitJobRequest(**values)
+
+
+def test_custom_pallet_dimensions_create_a_job_scoped_config(tmp_path):
+    request = _fruit_job_request(
+        pallet_type="custom",
+        pallet_width_mm=850.5,
+        pallet_length_mm=1350,
+    )
+
+    dashboard_api._validate_requested_pallet(request)
+    config_path = dashboard_api._pallet_config_for_job(tmp_path, request)
+
+    assert config_path.parent == tmp_path
+    assert json.loads(config_path.read_text(encoding="utf-8")) == {
+        "pallet_types": {
+            "custom": {"width_mm": 850.5, "length_mm": 1350.0},
+        }
+    }
+
+
+def test_custom_pallet_requires_both_dimensions():
+    import pytest
+    from fastapi import HTTPException
+
+    request = _fruit_job_request(pallet_type="custom", pallet_width_mm=850)
+
+    with pytest.raises(HTTPException, match="width and length"):
+        dashboard_api._validate_requested_pallet(request)
 
 
 def test_result_payload_exposes_average_and_overlay(tmp_path, monkeypatch):
