@@ -465,6 +465,29 @@ The container reads them from `/models/yolo11x.pt` and
 `models_ready: true` after both files are mounted. This keeps the container
 image small and means GitHub Actions does not upload or download model files.
 
+The image pins PyTorch and defaults to its CUDA 11.8 wheel for broad NVIDIA
+driver compatibility (Linux driver 450.80.02 or newer). The host still needs
+an NVIDIA GPU, a compatible NVIDIA driver, and NVIDIA Container Toolkit; the
+container uses the host driver and cannot replace it. Newer CUDA wheel families
+supported by the pinned PyTorch release can be selected at build time without
+editing the Dockerfile:
+
+```bash
+docker build \
+  --build-arg PYTORCH_CUDA_FLAVOR=cu121 \
+  -t fruit-pipeline:cu121 .
+```
+
+Keep `FRUIT_PIPELINE_DEVICE=cuda` to require GPU inference. If the host driver,
+container runtime, and selected wheel are incompatible, the job fails instead
+of silently running SAM on the CPU. To verify a deployment before submitting a
+job:
+
+```bash
+docker compose exec fruit-pipeline python -c \
+  "import torch; print(torch.__version__, torch.version.cuda); assert torch.cuda.is_available(); print(torch.cuda.get_device_name())"
+```
+
 ## Next stages (not implemented here)
 
 Fruit-type classification and rotten/fine quality detection can be added as
