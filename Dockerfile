@@ -18,15 +18,23 @@ RUN apt-get update \
     && apt-get install --no-install-recommends --yes ffmpeg git libglib2.0-0 libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Install the project dependencies before copying application source.  The
+# temporary package is enough for pip to read the dependency metadata and
+# create the console entry points.  PYTHONPATH points those entry points at
+# the real source copied below.  Consequently, normal src/ edits do not
+# invalidate the expensive PyTorch/OpenCV/Ultralytics installation layer.
 COPY pyproject.toml README.md ./
-COPY src ./src
-RUN python -m pip install --no-cache-dir ".[api]"
-
-COPY config ./config
+RUN mkdir -p src/fruit_pipeline \
+    && touch src/fruit_pipeline/__init__.py \
+    && python -m pip install --no-cache-dir ".[api]" \
+    && rm -rf src build fruit_pipeline.egg-info
 
 RUN useradd --create-home --uid 10001 appuser \
     && mkdir -p /app/output/dashboard \
     && chown -R appuser:appuser /app/output
+
+COPY src ./src
+COPY config ./config
 
 USER appuser
 EXPOSE 8010
