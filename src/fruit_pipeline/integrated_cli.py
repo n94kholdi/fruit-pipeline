@@ -14,18 +14,97 @@ from fruit_pipeline.integrated_pipeline import (
     media_source_stem,
 )
 from fruit_pipeline.live import FruitLiveReporter
+from fruit_pipeline.sam_only_pipeline import SamOnlyConfig
 from fruit_pipeline.size_estimation.pipeline import SizeEstimationConfig
+
+INFERENCE_MODES = ("sam_only", "detector")
 
 
 def build_parser():
     parser = build_detection_parser()
     parser.description = (
-        "Select/load pallet corners, then detect, segment, count, and size fruit in an image or video."
+        "Select/load pallet corners, then detect, segment, count, and size fruit in an image or video. "
+        "Two inference modes: 'sam_only' (default, see --inference-mode) needs no detector at all -- "
+        "SAM's own automatic mask generator proposes and segments every fruit; 'detector' is the original "
+        "detector + box-prompted-SAM pipeline (see the 'detection'/'merge' groups below)."
     )
     for action in parser._actions:
         if action.dest == "image":
             action.help = "Path to one input image or video."
             break
+
+    mode = parser.add_argument_group("inference mode")
+    mode.add_argument(
+        "--inference-mode",
+        choices=INFERENCE_MODES,
+        default="sam_only",
+        help="'sam_only' (default): no detector -- SAM's automatic mask generator proposes and segments "
+        "every fruit instance itself (tune it via the 'SAM automatic mask generator' group below; the "
+        "'detection'/'merge' groups are ignored in this mode). 'detector': the original detector + "
+        "box-prompted-SAM pipeline (the 'SAM automatic mask generator' group is ignored in this mode).",
+    )
+
+    mask_gen = parser.add_argument_group(
+        "SAM automatic mask generator",
+        description="--inference-mode sam_only only. Maps 1:1 onto "
+        "segment_anything.SamAutomaticMaskGenerator's own parameters.",
+    )
+    mask_gen.add_argument(
+        "--category-name",
+        default="fruit",
+        help="Category label written into every saved instance (default: 'fruit') -- there is no "
+        "detector to classify instances in this mode, so this is a fixed label applied to everything "
+        "SAM finds.",
+    )
+    mask_gen.add_argument(
+        "--points-per-side",
+        type=int,
+        default=32,
+        help="Side length of the dense point-prompt grid SAM uses to propose masks (default: 32, i.e. "
+        "32x32=1024 points). Higher finds more/smaller instances but is slower.",
+    )
+    mask_gen.add_argument("--points-per-batch", type=int, default=64, help="Points run through SAM per batch.")
+    mask_gen.add_argument(
+        "--pred-iou-thresh",
+        type=float,
+        default=0.88,
+        help="SAM's own predicted-mask-quality cutoff in [0,1]; masks below this are dropped.",
+    )
+    mask_gen.add_argument(
+        "--stability-score-thresh",
+        type=float,
+        default=0.95,
+        help="Cutoff in [0,1] on how stable a mask is to the binarization threshold; masks below this are dropped.",
+    )
+    mask_gen.add_argument("--stability-score-offset", type=float, default=1.0, help="Offset used when computing stability score.")
+    mask_gen.add_argument(
+        "--box-nms-thresh",
+        type=float,
+        default=0.7,
+        help="IoU threshold for deduping overlapping mask proposals (SAM's own NMS over its point grid).",
+    )
+    mask_gen.add_argument(
+        "--crop-n-layers",
+        type=int,
+        default=0,
+        help="If > 0, additionally reruns the point grid on image crops at that many extra zoom layers -- "
+        "helps catch small instances a single full-image pass misses, at extra runtime cost.",
+    )
+    mask_gen.add_argument("--crop-nms-thresh", type=float, default=0.7, help="NMS threshold between crop layers.")
+    mask_gen.add_argument("--crop-overlap-ratio", type=float, default=512 / 1500, help="Overlap between image crops.")
+    mask_gen.add_argument(
+        "--crop-n-points-downscale-factor",
+        type=int,
+        default=1,
+        help="Shrinks the point grid by this factor for each crop layer beyond the first.",
+    )
+    mask_gen.add_argument(
+        "--min-mask-region-area",
+        type=int,
+        default=0,
+        help="If > 0, uses OpenCV to drop small disconnected mask fragments and fill small holes below this "
+        "area (pixels) in every returned mask.",
+    )
 
     sizing = parser.add_argument_group("calibrated fruit sizing")
     sizing.add_argument("--camera-id", required=True, help="Camera calibration identifier.")
@@ -136,7 +215,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     selection_path = Path(args.pallet_selection) if args.pallet_selection else (
         output_dir / "pallet_selection.json"
     )
-    detection_config = _config_from_args(args, str(source), str(output_dir))
+    detection_config = None
+    sam_only_config = None
+    if args.inference_mode == "sam_only":
+        sam_only_config = SamOnlyConfig(
+            image_path=str(source),
+            output_dir=str(output_dir),
+            sam_checkpoint=args.sam_checkpoint,
+            sam_model_type=args.sam_model_type,
+            category_name=args.category_name,
+            points_per_side=args.points_per_side,
+            points_per_batch=args.points_per_batch,
+            pred_iou_thresh=args.pred_iou_thresh,
+            stability_score_thresh=args.stability_score_thresh,
+            stability_score_offset=args.stability_score_offset,
+            box_nms_thresh=args.box_nms_thresh,
+            crop_n_layers=args.crop_n_layers,
+            crop_nms_thresh=args.crop_nms_thresh,
+            crop_overlap_ratio=args.crop_overlap_ratio,
+            crop_n_points_downscale_factor=args.crop_n_points_downscale_factor,
+            min_mask_region_area=args.min_mask_region_area,
+            min_mask_area=args.min_mask_area,
+            border_filter_enabled=not args.no_border_filter,
+            border_touch_ratio=args.border_touch_ratio,
+            aspect_ratio_filter_enabled=not args.no_aspect_ratio_filter,
+            max_aspect_ratio=args.max_aspect_ratio,
+            device=args.device,
+            save_visualization=not args.no_visualization,
+        )
+    else:
+        detection_config = _config_from_args(args, str(source), str(output_dir))
     sizing_config = SizeEstimationConfig(
         camera_id=args.camera_id,
         camera_group=args.camera_group,
@@ -149,6 +257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     config = IntegratedPipelineConfig(
         detection=detection_config,
+        sam_only=sam_only_config,
         sizing=sizing_config,
         pallet_type=args.pallet_type,
         pallet_selection_path=selection_path,

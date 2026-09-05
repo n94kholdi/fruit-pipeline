@@ -81,6 +81,10 @@ class FruitJobRequest(BaseModel):
     resize_to_calibration: bool = True
     allow_unsafe_resize: bool = False
     max_frames: int | None = Field(default=None, ge=1)
+    # "sam_only" (default): no detector -- SAM's own automatic mask generator
+    # proposes and segments every fruit. "detector": the original detector +
+    # box-prompted-SAM pipeline.
+    inference_mode: Literal["sam_only", "detector"] = "sam_only"
 
 
 class StreamInputRequest(BaseModel):
@@ -400,23 +404,27 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
         "--max-calibration-error", str(request.max_calibration_error),
         "--frame-step", str(request.frame_step),
         "--min-pallet-overlap", str(request.min_pallet_overlap),
-        "--detector-weights", DETECTOR_WEIGHTS,
         "--sam-checkpoint", SAM_CHECKPOINT,
         "--device", DEVICE,
-        "--sam-batch-size", "1",
-        "--tile-size-k", "8",
-        "--min-tile-size", "320",
-        "--max-tile-size", "2048",
-        "--max-tiles", "12",
-        "--overlap-ratio", "0.15",
-        "--nms-metric", "diou",
-        "--merge-iou-threshold", "0.5",
-        "--containment-threshold", "0",
-        "--conf-threshold", "0.05",
+        "--inference-mode", request.inference_mode,
         "--live-job-dir", str(job_dir),
         "--live-job-id", job_id,
         "-v",
     ]
+    if request.inference_mode == "detector":
+        command += [
+            "--detector-weights", DETECTOR_WEIGHTS,
+            "--sam-batch-size", "1",
+            "--tile-size-k", "8",
+            "--min-tile-size", "320",
+            "--max-tile-size", "2048",
+            "--max-tiles", "12",
+            "--overlap-ratio", "0.15",
+            "--nms-metric", "diou",
+            "--merge-iou-threshold", "0.5",
+            "--containment-threshold", "0",
+            "--conf-threshold", "0.05",
+        ]
     if request.resize_to_calibration:
         command.append("--resize-to-calibration")
     if request.allow_unsafe_resize:
@@ -680,9 +688,10 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
     except CalibrationError as exc:
         raise HTTPException(404, str(exc)) from exc
     _validate_requested_pallet(request)
-    missing_models = [
-        path for path in (DETECTOR_WEIGHTS, SAM_CHECKPOINT) if not Path(path).is_file()
-    ]
+    required_models = (
+        (SAM_CHECKPOINT,) if request.inference_mode == "sam_only" else (DETECTOR_WEIGHTS, SAM_CHECKPOINT)
+    )
+    missing_models = [path for path in required_models if not Path(path).is_file()]
     if missing_models:
         raise HTTPException(
             503,
