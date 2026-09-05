@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fruit-pipeline"
+version = "0.1.0"
+description = "Pretrained-only tiled detection + segmentation pipeline for densely packed fruit images"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "PyYAML",
+    "sahi",
+    "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
+    "torch",
+    "torchvision",
+    "ultralytics",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.110,<1",
+    "python-multipart>=0.0.9,<1",
+    "uvicorn[standard]>=0.27,<1",
+]
+dev = ["pycocotools", "pytest"]
+
+eval = ["pycocotools"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fruit_pipeline = ["config/prompts/*.yaml"]
+
+[project.scripts]
+fruit-pipeline = "fruit_pipeline.cli:main"
+fruit-size-pipeline = "fruit_pipeline.integrated_cli:main"
+fruit-inference = "fruit_pipeline.inference:main"
+fruit-eval = "fruit_pipeline.eval.cli:main"
+calibrate-camera = "fruit_pipeline.camera_calibration.calibrate:main"
+select-pallet-corners = "fruit_pipeline.size_estimation.manual_cli:select_pallet_main"
+measure-pallet-object = "fruit_pipeline.size_estimation.manual_cli:measure_object_main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

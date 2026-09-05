@@ -5,8 +5,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from fruit_pipeline.detect import TileResult
-from fruit_pipeline.segment import FruitInstance
+from fruit_pipeline.detection.tiling import TileResult
+from fruit_pipeline.segmentation.sam import FruitInstance
 
 
 def _color_for_instance(instance_id: int) -> tuple[int, int, int]:

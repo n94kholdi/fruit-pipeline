@@ -6,9 +6,9 @@ import argparse
 import logging
 from pathlib import Path
 
-from fruit_pipeline.detect import DEFAULT_PROMPT_CLASSES
+from fruit_pipeline.detection.backends import YOLOE_MODES
 from fruit_pipeline.pipeline import PipelineConfig, load_models, run_pipeline
-from fruit_pipeline.segment import SAM_MODEL_TYPES
+from fruit_pipeline.segmentation.sam import SAM_MODEL_TYPES
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -33,20 +33,60 @@ def build_parser() -> argparse.ArgumentParser:
     detector = parser.add_argument_group("detection")
     detector.add_argument(
         "--detector-weights",
-        default="yolo11x.pt",
-        help="Ultralytics detector checkpoint. Use a *-world.pt checkpoint with --use-yolo-world.",
+        default="models/yolo11x.pt",
+        help="Ultralytics detector checkpoint (default: models/yolo11x.pt). Bare filenames like yolo11x.pt "
+        "are resolved under models/. Use a *-world.pt checkpoint with --detector yolo-world, or a "
+        "yoloe*.pt checkpoint (a *-seg-pf.pt variant for --yoloe-mode prompt_free) with --detector yoloe.",
+    )
+    detector.add_argument(
+        "--detector",
+        choices=["default", "yolo-world", "yoloe"],
+        default="default",
+        help="Detector backend (default: 'default' -- plain class-agnostic detector). 'yolo-world': open-vocab "
+        "text prompting via YOLO-World (requires the ultralytics CLIP extra, auto-installed on first use, "
+        "~350MB text-encoder download). 'yoloe': native Ultralytics YOLOE (ICCV 2025) -- see --yoloe-mode for "
+        "its text/visual/prompt_free prompt modes, e.g. --yoloe-mode visual for the citrus-pile case where "
+        "text prompts draw one giant box around a pile instead of individual fruit.",
     )
     detector.add_argument(
         "--use-yolo-world",
         action="store_true",
-        help="Treat --detector-weights as YOLO-World and prompt it with --prompt-classes for open-vocabulary "
-        "detection instead of relying on COCO's 80 classes. Requires the ultralytics CLIP extra "
-        "(auto-installed on first use, downloads an additional ~350MB text-encoder checkpoint).",
+        help="Deprecated alias for --detector yolo-world.",
+    )
+    detector.add_argument(
+        "--yoloe-mode",
+        choices=list(YOLOE_MODES),
+        default="text",
+        help="--detector yoloe only. 'text': prompt with --prompt-config's fruit descriptions (like yolo-world, "
+        "but native YOLOE). 'visual': prompt with one or more --visual-prompt exemplar crops instead of text -- "
+        "the point of this mode: showing the model an instance instead of asking it to interpret a word. "
+        "'prompt_free': open-vocabulary with no prompt at all, using the checkpoint's built-in vocabulary "
+        "(requires a *-seg-pf.pt checkpoint).",
+    )
+    detector.add_argument(
+        "--visual-prompt",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="--yoloe-mode visual only. Path to one exemplar crop image (a tight crop of a single instance, "
+        "e.g. one orange). Repeatable to supply multiple exemplars -- each runs as its own detection pass per "
+        "tile, unioned into the raw detections like any other tile.",
+    )
+    detector.add_argument(
+        "--prompt-config",
+        default=None,
+        metavar="PATH",
+        help="YAML of attribute-rich text prompts for --detector yolo-world or --yoloe-mode text (default: "
+        "the packaged prompt config). The format uses a 'fruit' class with descriptive prompts "
+        "('a round orange citrus fruit' rather than just 'orange') plus an optional 'background' class whose "
+        "matches are dropped before merging, absorbing non-fruit regions instead of misclassifying them as "
+        "fruit. Ignored if --prompt-classes is set (legacy override, no background split).",
     )
     detector.add_argument(
         "--prompt-classes",
-        default=",".join(DEFAULT_PROMPT_CLASSES),
-        help="Comma-separated text prompt classes for YOLO-World (only used with --use-yolo-world).",
+        default=None,
+        help="Deprecated: comma-separated text prompt classes, overriding --prompt-config entirely (no "
+        "background class). Prefer --prompt-config.",
     )
     detector.add_argument(
         "--tile-size",
@@ -145,20 +185,50 @@ def build_parser() -> argparse.ArgumentParser:
     merge = parser.add_argument_group("merge")
     merge.add_argument(
         "--merge-strategy",
-        choices=["greedy_nmm", "nmm", "nms"],
-        default="greedy_nmm",
-        help="How overlapping tiled detections are combined. greedy_nmm (default) merges touching/adjacent "
-        "fruit instead of deleting them like plain nms would.",
+        choices=["seam-aware", "nms", "nmm", "greedy_nmm"],
+        default="seam-aware",
+        help="How overlapping tiled detections are combined (default: seam-aware). seam-aware only unions two "
+        "detections when they came from different, adjacent tiles near the shared tile-overlap band (i.e. "
+        "plausibly the same fruit split by tiling) -- every other overlap is suppressed, never unioned. nmm is "
+        "the old behaviour: it unions ANY sufficiently-overlapping pair regardless of tile geometry, which can "
+        "wrongly blob together two touching-but-distinct fruit. nms never unions at all (pure suppression). "
+        "greedy_nmm is a deprecated alias for the old default, kept for backward compatibility.",
     )
     merge.add_argument(
         "--merge-metric",
         choices=["IOU", "IOS"],
         default="IOU",
-        help="Overlap metric for merging (default IOU). IOS can over-merge distinct, touching fruit into one "
-        "unioned box on a dense crate photo (see merge.py); switch to IOS only if under-merging (duplicate "
-        "detections of the same fruit) turns out to be the bigger problem for your images.",
+        help="Overlap metric used ONLY by the legacy --merge-strategy nmm/greedy_nmm (SAHI's own match metric). "
+        "seam-aware/nms use --nms-metric instead. IOS can over-merge distinct, touching fruit into one unioned "
+        "box on a dense crate photo (see detection/merging.py); switch to IOS only if under-merging (duplicate detections "
+        "of the same fruit) turns out to be the bigger problem for your images.",
     )
-    merge.add_argument("--merge-iou-threshold", type=float, default=0.5, help="Overlap threshold to merge two boxes.")
+    merge.add_argument("--merge-iou-threshold", type=float, default=0.5, help="Overlap threshold to merge/suppress two boxes.")
+    merge.add_argument(
+        "--seam-margin",
+        type=float,
+        default=None,
+        help="--merge-strategy seam-aware only: how far (px) from the tiles' shared overlap band a box may be "
+        "and still be considered seam-eligible for unioning. Default: the tile overlap in pixels "
+        "(overlap_ratio * tile_size), computed per image.",
+    )
+    merge.add_argument(
+        "--nms-metric",
+        choices=["iou", "diou"],
+        default="iou",
+        help="Suppression metric for --merge-strategy seam-aware/nms (default: iou). diou (Distance-IoU) adds a "
+        "normalized center-distance penalty, so two touching same-colored fruit with high IoU but distinct "
+        "centers both survive instead of one being wrongly suppressed as a duplicate.",
+    )
+    merge.add_argument(
+        "--containment-threshold",
+        type=float,
+        default=0.9,
+        help="--merge-strategy seam-aware/nms only: if one box's intersection with another, divided by the "
+        "SMALLER box's area, exceeds this, the lower-scoring box is dropped outright (pure suppression, never "
+        "a union) -- catches a small box mostly swallowed by a much larger one, which plain IoU can miss since "
+        "it's diluted by the larger box's area. Set <= 0 to disable.",
+    )
     merge.add_argument(
         "--no-class-agnostic-merge",
         action="store_true",
@@ -213,8 +283,12 @@ def _config_from_args(args, image_path: str, output_dir: str) -> PipelineConfig:
         image_path=image_path,
         output_dir=output_dir,
         detector_weights=args.detector_weights,
+        detector=args.detector,
         use_yolo_world=args.use_yolo_world,
-        prompt_classes=[c.strip() for c in args.prompt_classes.split(",") if c.strip()],
+        prompt_classes=[c.strip() for c in args.prompt_classes.split(",") if c.strip()] if args.prompt_classes else None,
+        prompt_config=args.prompt_config,
+        yoloe_mode=args.yoloe_mode,
+        visual_prompt_paths=args.visual_prompt or [],
         tile_size=args.tile_size,
         max_tiles=args.max_tiles,
         tile_size_k=args.tile_size_k,
@@ -232,6 +306,9 @@ def _config_from_args(args, image_path: str, output_dir: str) -> PipelineConfig:
         merge_strategy=args.merge_strategy,
         merge_metric=args.merge_metric,
         merge_iou_threshold=args.merge_iou_threshold,
+        seam_margin=args.seam_margin,
+        nms_metric=args.nms_metric,
+        containment_threshold=args.containment_threshold,
         class_agnostic_merge=not args.no_class_agnostic_merge,
         oversized_filter_enabled=not args.no_oversized_filter,
         oversized_max_area_ratio=args.oversized_ratio,
