@@ -2,7 +2,7 @@ name: Test and publish fruit-pipeline image
 
 on:
   push:
-    branches: [master, main, development, dashoard-integration]
+    branches: [master, main, development, dashoard-integration, feat-sam-opimization]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
