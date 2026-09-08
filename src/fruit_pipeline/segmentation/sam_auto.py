@@ -16,12 +16,11 @@ unchanged.
 from __future__ import annotations
 
 import logging
-import os
 
 import numpy as np
 
-from fruit_pipeline.segmentation.sam import SAM_MODEL_TYPES, FruitInstance
-from fruit_pipeline.utils.paths import resolve_model_path
+from fruit_pipeline.segmentation.sam import FruitInstance
+from fruit_pipeline.segmentation.sam_manager import SAMModelManager, get_sam_model_manager
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +40,7 @@ def load_sam_automatic_generator(
     crop_overlap_ratio: float = 512 / 1500,
     crop_n_points_downscale_factor: int = 1,
     min_mask_region_area: int = 0,
+    use_fp16: bool = True,
 ):
     """Load a pretrained SAM checkpoint and return a ``SamAutomaticMaskGenerator``.
 
@@ -61,23 +61,11 @@ def load_sam_automatic_generator(
       mask fragments and fill small holes (requires opencv-python, already
       a dependency here).
     """
-    from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+    from segment_anything import SamAutomaticMaskGenerator
 
-    if model_type not in SAM_MODEL_TYPES:
-        raise ValueError(f"Unknown SAM model_type '{model_type}', expected one of {SAM_MODEL_TYPES}")
-    checkpoint = resolve_model_path(checkpoint)
-    if not os.path.exists(checkpoint):
-        raise FileNotFoundError(
-            f"SAM checkpoint not found: {checkpoint}\n"
-            "Download the matching checkpoint from "
-            "https://github.com/facebookresearch/segment-anything#model-checkpoints "
-            "or point --sam-checkpoint at an existing one."
-        )
-
-    sam = sam_model_registry[model_type](checkpoint=checkpoint)
-    sam.to(device=device)
+    manager = get_sam_model_manager(checkpoint, model_type, device, use_fp16)
     generator = SamAutomaticMaskGenerator(
-        sam,
+        manager.get_model(),
         points_per_side=points_per_side,
         points_per_batch=points_per_batch,
         pred_iou_thresh=pred_iou_thresh,
@@ -91,8 +79,20 @@ def load_sam_automatic_generator(
         min_mask_region_area=min_mask_region_area,
         output_mode="binary_mask",
     )
-    logger.info("Loaded SAM (%s) automatic mask generator from %s on %s", model_type, checkpoint, device)
-    return generator
+    logger.info("Created SAM (%s) automatic mask generator from persistent model on %s", model_type, device)
+    return ManagedAutomaticMaskGenerator(manager, generator)
+
+
+class ManagedAutomaticMaskGenerator:
+    """Apply inference mode, autocast, and locking around SAM's generator."""
+
+    def __init__(self, manager: SAMModelManager, generator) -> None:
+        self.manager = manager
+        self.generator = generator
+
+    def generate(self, image_rgb: np.ndarray):
+        with self.manager.inference_context():
+            return self.generator.generate(image_rgb)
 
 
 def generate_instances(

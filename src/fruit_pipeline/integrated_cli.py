@@ -235,6 +235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             crop_overlap_ratio=args.crop_overlap_ratio,
             crop_n_points_downscale_factor=args.crop_n_points_downscale_factor,
             min_mask_region_area=args.min_mask_region_area,
+            sam_use_fp16=args.sam_fp16,
             min_mask_area=args.min_mask_area,
             border_filter_enabled=not args.no_border_filter,
             border_touch_ratio=args.border_touch_ratio,
@@ -280,6 +281,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     def publish_frame(frame_result, preview, processed_count, total_count):
         if reporter is None:
             return
+        if (Path(args.live_job_dir) / "cancel.requested").is_file():
+            raise InterruptedError("Fruit-analysis job cancellation requested")
         reporter.publish_frame(
             preview,
             frame_index=frame_result.frame_index,

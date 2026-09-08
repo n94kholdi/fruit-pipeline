@@ -13,18 +13,15 @@ import logging
 from dataclasses import dataclass
 
 import numpy as np
-import torch
 
 from fruit_pipeline.detection.merging import Detection
-from fruit_pipeline.utils.paths import resolve_model_path
+from fruit_pipeline.segmentation.sam_manager import (
+    SAM_MODEL_TYPES,
+    SAMModelManager,
+    get_sam_model_manager,
+)
 
 logger = logging.getLogger(__name__)
-
-# ViT-B is ~3-4x faster and much lighter on GPU/CPU memory than ViT-L, at a
-# noticeable drop in mask boundary quality on cluttered/touching objects;
-# ViT-H is the highest quality but slowest and heaviest. ViT-L is a
-# reasonable default middle ground for dense fruit crates.
-SAM_MODEL_TYPES = ("vit_b", "vit_l", "vit_h")
 
 
 @dataclass
@@ -39,31 +36,28 @@ class FruitInstance:
     mask: np.ndarray  # bool array, shape (H, W)
 
 
-def load_sam(checkpoint: str, model_type: str = "vit_l", device: str = "cpu"):
+def load_sam(
+    checkpoint: str,
+    model_type: str = "vit_l",
+    device: str = "cpu",
+    use_fp16: bool = True,
+):
     """Load a pretrained SAM checkpoint and return a ``SamPredictor``.
 
     No automatic mask generator is created here on purpose (see module
     docstring) — only the predictor, which is driven by explicit box prompts.
     """
-    import os
+    return get_sam_model_manager(checkpoint, model_type, device, use_fp16).get_predictor()
 
-    from segment_anything import SamPredictor, sam_model_registry
 
-    if model_type not in SAM_MODEL_TYPES:
-        raise ValueError(f"Unknown SAM model_type '{model_type}', expected one of {SAM_MODEL_TYPES}")
-    checkpoint = resolve_model_path(checkpoint)
-    if not os.path.exists(checkpoint):
-        raise FileNotFoundError(
-            f"SAM checkpoint not found: {checkpoint}\n"
-            "Download the matching checkpoint from "
-            "https://github.com/facebookresearch/segment-anything#model-checkpoints "
-            "or point --sam-checkpoint at an existing one."
-        )
-
-    sam = sam_model_registry[model_type](checkpoint=checkpoint)
-    sam.to(device=device)
-    logger.info("Loaded SAM (%s) from %s on %s", model_type, checkpoint, device)
-    return SamPredictor(sam)
+def load_sam_manager(
+    checkpoint: str,
+    model_type: str = "vit_l",
+    device: str = "cpu",
+    use_fp16: bool = True,
+) -> SAMModelManager:
+    """Load or reuse the persistent manager used by production pipelines."""
+    return get_sam_model_manager(checkpoint, model_type, device, use_fp16)
 
 
 def segment_boxes(
@@ -81,28 +75,12 @@ def segment_boxes(
     if not detections:
         return []
 
-    predictor.set_image(image_rgb)
-    device = predictor.device
-    original_size = image_rgb.shape[:2]
-
     boxes_np = np.array([det.box for det in detections], dtype=np.float32)
     instances: list[FruitInstance] = []
 
-    for start in range(0, len(detections), batch_size):
-        chunk_dets = detections[start : start + batch_size]
-        chunk_boxes = torch.as_tensor(boxes_np[start : start + batch_size], device=device)
-        transformed_boxes = predictor.transform.apply_boxes_torch(chunk_boxes, original_size)
-
-        masks, iou_predictions, _ = predictor.predict_torch(
-            point_coords=None,
-            point_labels=None,
-            boxes=transformed_boxes,
-            multimask_output=False,
-        )
-        masks = masks.squeeze(1).cpu().numpy()  # (chunk, H, W) bool
-        scores = iou_predictions.squeeze(1).cpu().numpy()
-
-        for det, mask, sam_score in zip(chunk_dets, masks, scores):
+    if isinstance(predictor, SAMModelManager):
+        result = predictor.run_inference(image_rgb, boxes_np, batch_size=batch_size)
+        for det, mask, sam_score in zip(detections, result.masks, result.scores):
             instances.append(
                 FruitInstance(
                     instance_id=det.instance_id,
@@ -110,9 +88,45 @@ def segment_boxes(
                     detector_score=det.score,
                     category_name=det.category_name,
                     sam_score=float(sam_score),
-                    mask=mask.astype(bool),
+                    mask=mask.astype(bool, copy=False),
                 )
             )
+        logger.info("SAM produced %d masks (batch_size=%d)", len(instances), batch_size)
+        return instances
+
+    # Compatibility path for callers that inject a raw SamPredictor.
+    import torch
+
+    predictor.set_image(image_rgb)
+    device = predictor.device
+    original_size = image_rgb.shape[:2]
+
+    with torch.inference_mode():
+        for start in range(0, len(detections), batch_size):
+            chunk_dets = detections[start : start + batch_size]
+            chunk_boxes = torch.as_tensor(boxes_np[start : start + batch_size], device=device)
+            transformed_boxes = predictor.transform.apply_boxes_torch(chunk_boxes, original_size)
+
+            masks, iou_predictions, _ = predictor.predict_torch(
+                point_coords=None,
+                point_labels=None,
+                boxes=transformed_boxes,
+                multimask_output=False,
+            )
+            masks = masks.squeeze(1).cpu().numpy()  # (chunk, H, W) bool
+            scores = iou_predictions.squeeze(1).cpu().numpy()
+
+            for det, mask, sam_score in zip(chunk_dets, masks, scores):
+                instances.append(
+                    FruitInstance(
+                        instance_id=det.instance_id,
+                        box=det.box,
+                        detector_score=det.score,
+                        category_name=det.category_name,
+                        sam_score=float(sam_score),
+                        mask=mask.astype(bool),
+                    )
+                )
 
     logger.info("SAM produced %d masks (batch_size=%d)", len(instances), batch_size)
     return instances

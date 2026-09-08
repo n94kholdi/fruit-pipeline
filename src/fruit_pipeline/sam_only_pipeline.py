@@ -12,7 +12,7 @@ prompting, so there is no detector, no tiling, and no per-tile merge stage.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -21,6 +21,7 @@ from fruit_pipeline.detection.tiling import TileStats
 from fruit_pipeline.pipeline import resolve_device, save_json
 from fruit_pipeline.segmentation.sam import FruitInstance, filter_masks
 from fruit_pipeline.segmentation.sam_auto import generate_instances, load_sam_automatic_generator
+from fruit_pipeline.segmentation.sam_manager import env_flag
 from fruit_pipeline.visualization.rendering import draw_overlays
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,9 @@ class SamOnlyConfig:
     crop_overlap_ratio: float = 512 / 1500
     crop_n_points_downscale_factor: int = 1
     min_mask_region_area: int = 0
+    sam_use_fp16: bool = field(
+        default_factory=lambda: env_flag("FRUIT_PIPELINE_SAM_USE_FP16", True)
+    )
 
     # Mask sanity filters (same knobs/defaults as fruit_pipeline.cli)
     min_mask_area: int = 30
@@ -76,6 +80,7 @@ def load_models(config: SamOnlyConfig):
         crop_overlap_ratio=config.crop_overlap_ratio,
         crop_n_points_downscale_factor=config.crop_n_points_downscale_factor,
         min_mask_region_area=config.min_mask_region_area,
+        use_fp16=config.sam_use_fp16,
     )
 
 

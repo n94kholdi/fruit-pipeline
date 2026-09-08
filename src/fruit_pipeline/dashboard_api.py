@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Iterator, Literal
@@ -28,6 +30,8 @@ from fruit_pipeline.camera_calibration.models import CalibrationError
 from fruit_pipeline.integrated_pipeline import media_source_stem, normalize_to_resolution
 from fruit_pipeline.live import FruitLiveReporter
 from fruit_pipeline.pallet_geometry.pallet_config import PalletTypeConfig
+from fruit_pipeline.pipeline import resolve_device
+from fruit_pipeline.segmentation.sam_manager import env_flag, get_sam_model_manager
 
 
 DATA_DIR = Path(os.getenv("FRUIT_PIPELINE_DATA_DIR", "outputs/dashboard")).resolve()
@@ -38,14 +42,36 @@ PALLET_CONFIG = Path(os.getenv("FRUIT_PIPELINE_PALLET_CONFIG", "config/pallet_ty
 DETECTOR_WEIGHTS = os.getenv("FRUIT_PIPELINE_DETECTOR_WEIGHTS", "models/yolo11x.pt")
 SAM_CHECKPOINT = os.getenv("FRUIT_PIPELINE_SAM_CHECKPOINT", "models/sam_vit_l_0b3195.pth")
 DEVICE = os.getenv("FRUIT_PIPELINE_DEVICE", "cpu")
+SAM_MODEL_TYPE = os.getenv("FRUIT_PIPELINE_SAM_MODEL_TYPE", "vit_l")
+SAM_USE_FP16 = env_flag("FRUIT_PIPELINE_SAM_USE_FP16", True)
 MAX_UPLOAD_BYTES = int(os.getenv("FRUIT_PIPELINE_MAX_UPLOAD_BYTES", str(1024**3)))
 WORKERS = max(1, int(os.getenv("FRUIT_PIPELINE_JOB_WORKERS", "1")))
 MAX_CAPTURED_CALIBRATION_FRAMES = 300
+logger = logging.getLogger(__name__)
 
 for directory in (CALIBRATION_DIR, INPUT_DIR, JOB_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Tarebar Fruit Pipeline API", version="1.0.0")
+def preload_sam_model() -> None:
+    """Populate the process-wide GPU cache before the first inference request."""
+    if not Path(SAM_CHECKPOINT).is_file():
+        logger.warning("SAM startup preload skipped; checkpoint is missing: %s", SAM_CHECKPOINT)
+        return
+    get_sam_model_manager(
+        SAM_CHECKPOINT,
+        model_type=SAM_MODEL_TYPE,
+        device=resolve_device(DEVICE),
+        use_fp16=SAM_USE_FP16,
+    )
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    preload_sam_model()
+    yield
+
+
+app = FastAPI(title="Tarebar Fruit Pipeline API", version="1.0.0", lifespan=_lifespan)
 origins = [item.strip() for item in os.getenv("FRUIT_PIPELINE_CORS_ORIGINS", "http://localhost:3000").split(",") if item.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -432,26 +458,21 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
     if request.max_frames is not None:
         command.extend(["--max-frames", str(request.max_frames)])
     try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        with jobs_lock:
-            job_processes[job_id] = process
-        if cancel_path.is_file():
-            process.terminate()
-        stdout, stderr = process.communicate()
-        with jobs_lock:
-            job_processes.pop(job_id, None)
-        log = (stdout + "\n" + stderr).strip()
-        (JOB_DIR / job_id / "pipeline.log").write_text(log + "\n", encoding="utf-8")
+        # Run inside the API process so its startup-loaded SAM weights remain
+        # resident on the GPU and are reused by later jobs. The manager
+        # serializes SAM's mutable predictor state when WORKERS > 1.
+        from fruit_pipeline.integrated_cli import main as run_integrated_cli
+
+        return_code = run_integrated_cli(command[3:])
         if cancel_path.is_file():
             _finish_cancelled(job_id, reporter)
             return
-        if process.returncode != 0:
-            raise RuntimeError(log[-4000:] or f"Pipeline exited with code {process.returncode}")
+        if return_code != 0:
+            raise RuntimeError(f"Pipeline exited with code {return_code}")
+        (JOB_DIR / job_id / "pipeline.log").write_text(
+            "Pipeline ran in the persistent in-process model runtime; see service logs.\n",
+            encoding="utf-8",
+        )
         result = _result_payload(job_id, output_dir, source)
         if cancel_path.is_file():
             _finish_cancelled(job_id, reporter)
@@ -459,8 +480,6 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
         _write_job(job_id, status="completed", result=result, error=None)
         reporter.emit("job_completed", status="completed", progress=100.0)
     except Exception as exc:
-        with jobs_lock:
-            job_processes.pop(job_id, None)
         if cancel_path.is_file():
             _finish_cancelled(job_id, reporter)
         else:

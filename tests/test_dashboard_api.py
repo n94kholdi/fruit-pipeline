@@ -24,6 +24,54 @@ def _fruit_job_request(**changes):
     return dashboard_api.FruitJobRequest(**values)
 
 
+def test_startup_preloads_the_persistent_sam_manager(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "sam.pth"
+    checkpoint.touch()
+    calls = []
+    monkeypatch.setattr(dashboard_api, "SAM_CHECKPOINT", str(checkpoint))
+    monkeypatch.setattr(dashboard_api, "SAM_MODEL_TYPE", "vit_l")
+    monkeypatch.setattr(dashboard_api, "SAM_USE_FP16", True)
+    monkeypatch.setattr(dashboard_api, "DEVICE", "cpu")
+    monkeypatch.setattr(
+        dashboard_api,
+        "get_sam_model_manager",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    dashboard_api.preload_sam_model()
+
+    assert calls == [
+        ((str(checkpoint),), {"model_type": "vit_l", "device": "cpu", "use_fp16": True})
+    ]
+
+
+def test_fruit_job_runs_in_process_to_reuse_startup_model(tmp_path, monkeypatch):
+    from fruit_pipeline import integrated_cli
+
+    calls = []
+    source = tmp_path / "input.jpg"
+    source.touch()
+    monkeypatch.setattr(dashboard_api, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(dashboard_api, "CALIBRATION_DIR", tmp_path / "calibrations")
+    monkeypatch.setattr(dashboard_api, "PALLET_CONFIG", tmp_path / "pallet_types.yaml")
+    monkeypatch.setattr(integrated_cli, "main", lambda argv: calls.append(argv) or 0)
+    monkeypatch.setattr(
+        dashboard_api,
+        "_result_payload",
+        lambda job_id, output_dir, source: {"job_id": job_id},
+    )
+    with dashboard_api.jobs_lock:
+        dashboard_api.jobs.clear()
+        dashboard_api.job_processes.clear()
+    dashboard_api._write_job("job-in-process", kind="fruit_analysis", status="queued")
+
+    dashboard_api._run_fruit_job("job-in-process", _fruit_job_request(), source)
+
+    assert calls and calls[0][0:2] == ["--image", str(source)]
+    assert dashboard_api._job("job-in-process")["status"] == "completed"
+    assert "job-in-process" not in dashboard_api.job_processes
+
+
 def test_custom_pallet_dimensions_create_a_job_scoped_config(tmp_path):
     request = _fruit_job_request(
         pallet_type="custom",
