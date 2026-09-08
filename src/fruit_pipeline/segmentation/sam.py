@@ -15,7 +15,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from fruit_pipeline.merge import Detection
+from fruit_pipeline.detection.merging import Detection
+from fruit_pipeline.utils.paths import resolve_model_path
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ def load_sam(checkpoint: str, model_type: str = "vit_l", device: str = "cpu"):
 
     if model_type not in SAM_MODEL_TYPES:
         raise ValueError(f"Unknown SAM model_type '{model_type}', expected one of {SAM_MODEL_TYPES}")
+    checkpoint = resolve_model_path(checkpoint)
     if not os.path.exists(checkpoint):
         raise FileNotFoundError(
             f"SAM checkpoint not found: {checkpoint}\n"

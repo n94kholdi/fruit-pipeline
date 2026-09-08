@@ -12,10 +12,12 @@ import cv2
 import numpy as np
 import torch
 
-from fruit_pipeline.detect import DEFAULT_PROMPT_CLASSES, TileStats, detect_tiled, load_detector
-from fruit_pipeline.merge import filter_oversized_boxes, merge_detections, to_detections
-from fruit_pipeline.segment import FruitInstance, filter_masks, load_sam, segment_boxes
-from fruit_pipeline.visualize import draw_overlays, draw_tile_grid
+from fruit_pipeline.config.prompts import DEFAULT_PROMPT_CONFIG_PATH, load_prompt_config
+from fruit_pipeline.detection.backends import DetectorBackend, load_detector_backend
+from fruit_pipeline.detection.merging import filter_oversized_boxes, merge_detections, to_detections
+from fruit_pipeline.detection.tiling import TileStats, detect_tiled
+from fruit_pipeline.segmentation.sam import FruitInstance, filter_masks, load_sam, segment_boxes
+from fruit_pipeline.visualization.rendering import draw_overlays, draw_tile_grid
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +28,13 @@ class PipelineConfig:
     output_dir: str
 
     # Detection
-    detector_weights: str = "yolo11x.pt"
-    use_yolo_world: bool = False
-    prompt_classes: list[str] = field(default_factory=lambda: list(DEFAULT_PROMPT_CLASSES))
+    detector_weights: str = "models/yolo11x.pt"
+    detector: str = "default"  # "default" | "yolo-world" | "yoloe"
+    use_yolo_world: bool = False  # deprecated: equivalent to detector="yolo-world", kept for old callers
+    prompt_classes: list[str] | None = None  # legacy override; if set, wins over prompt_config (no background split)
+    prompt_config: str | None = None  # custom PromptConfig YAML; None uses the packaged default
+    yoloe_mode: str = "text"  # "text" | "visual" | "prompt_free" -- detector="yoloe" only
+    visual_prompt_paths: list[str] = field(default_factory=list)  # exemplar crop paths -- yoloe_mode="visual" only
     tile_size: int | None = None  # None = adaptive (estimated from fruit diameter); set to force a fixed size
     max_tiles: int = 12  # advisory budget, logged if exceeded; not enforced when tile_size is adaptive
     tile_size_k: float = 8.0
@@ -45,12 +51,15 @@ class PipelineConfig:
     working_long_edge: int = 2800
 
     # Merge
-    merge_strategy: str = "greedy_nmm"
+    merge_strategy: str = "seam-aware"
     merge_metric: str = "IOU"
     merge_iou_threshold: float = 0.5
     class_agnostic_merge: bool = True
     oversized_filter_enabled: bool = True
     oversized_max_area_ratio: float = 3.0
+    seam_margin: float | None = None  # None = default to overlap_ratio * tile_size (computed at run time)
+    nms_metric: str = "iou"  # "iou" or "diou", used by seam-aware/nms strategies' suppression core
+    containment_threshold: float = 0.9  # intersection / smaller-box-area above which the lower-scoring box is dropped
 
     # Segmentation
     sam_checkpoint: str = "models/sam_vit_l_0b3195.pth"
@@ -74,16 +83,47 @@ def resolve_device(explicit: str) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def load_models(config: PipelineConfig):
-    """Load the detector + SAM predictor once, for reuse across many images."""
-    device = resolve_device(config.device)
-    detector = load_detector(
+def _resolve_detector_name(config: PipelineConfig) -> str:
+    return "yolo-world" if config.use_yolo_world else config.detector
+
+
+def _resolve_prompts(config: PipelineConfig) -> tuple[list[str], list[str]]:
+    """Fruit/background prompt lists for the yolo-world / yoloe-text backends.
+
+    ``prompt_classes`` (legacy, comma-separated CLI flag) wins if set, with
+    no background split. Otherwise loads ``prompt_config`` (default:
+    packaged default YAML), which carries both.
+    """
+    if config.prompt_classes:
+        return list(config.prompt_classes), []
+    prompt_config = load_prompt_config(config.prompt_config or DEFAULT_PROMPT_CONFIG_PATH)
+    return prompt_config.fruit_prompts, prompt_config.background_prompts
+
+
+def _load_backend(config: PipelineConfig, device: str) -> DetectorBackend:
+    detector_name = _resolve_detector_name(config)
+    fruit_prompts: list[str] = []
+    background_prompts: list[str] = []
+    needs_prompts = detector_name == "yolo-world" or (detector_name == "yoloe" and config.yoloe_mode == "text")
+    if needs_prompts:
+        fruit_prompts, background_prompts = _resolve_prompts(config)
+
+    return load_detector_backend(
+        detector=detector_name,
         weights_path=config.detector_weights,
         device=device,
         conf_threshold=config.conf_threshold,
-        use_yolo_world=config.use_yolo_world,
-        prompt_classes=config.prompt_classes,
+        fruit_prompts=fruit_prompts,
+        background_prompts=background_prompts,
+        yoloe_mode=config.yoloe_mode,
+        visual_prompt_paths=config.visual_prompt_paths,
     )
+
+
+def load_models(config: PipelineConfig):
+    """Load the detector + SAM predictor once, for reuse across many images."""
+    device = resolve_device(config.device)
+    detector = _load_backend(config, device)
     sam_predictor = load_sam(
         checkpoint=config.sam_checkpoint,
         model_type=config.sam_model_type,
@@ -103,13 +143,7 @@ def run_pipeline(config: PipelineConfig, detector=None, sam_predictor=None) -> l
     logger.info("Using device: %s", device)
 
     if detector is None:
-        detector = load_detector(
-            weights_path=config.detector_weights,
-            device=device,
-            conf_threshold=config.conf_threshold,
-            use_yolo_world=config.use_yolo_world,
-            prompt_classes=config.prompt_classes,
-        )
+        detector = _load_backend(config, device)
 
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -160,14 +194,14 @@ def run_pipeline(config: PipelineConfig, detector=None, sam_predictor=None) -> l
 
     debug_tiles_dir = str(output_dir / "tiles_debug" / stem) if config.debug_save_tiles else None
     try:
-        raw_predictions, tile_results, tile_stats = detect_tiled(
+        detection_result = detect_tiled(
             image_path=detect_image_path,
-            detection_model=detector,
+            backend=detector,
             tile_size=config.tile_size,
             overlap_ratio=config.overlap_ratio,
             conf_threshold=config.conf_threshold,
             include_standard_pred=config.include_standard_pred,
-            class_agnostic_relabel=not config.use_yolo_world,
+            class_agnostic_relabel=_resolve_detector_name(config) == "default",
             max_tiles=config.max_tiles,
             tile_size_k=config.tile_size_k,
             min_tile_size=config.min_tile_size,
@@ -181,12 +215,29 @@ def run_pipeline(config: PipelineConfig, detector=None, sam_predictor=None) -> l
         if temp_working_path:
             Path(temp_working_path).unlink(missing_ok=True)
 
+    raw_predictions = detection_result.raw_predictions
+    tile_results = detection_result.tile_results
+    tile_stats = detection_result.stats
+
+    # Default seam margin = the tile overlap in pixels, so a fruit split at
+    # a tile seam (guaranteed to land within the overlap band on both
+    # tiles) is always seam-eligible for union, without needing a separate
+    # per-run flag in the common case.
+    seam_margin = (
+        config.seam_margin if config.seam_margin is not None else config.overlap_ratio * tile_stats.tile_size
+    )
+
     merged = merge_detections(
         raw_predictions,
         strategy=config.merge_strategy,
         match_metric=config.merge_metric,
         match_threshold=config.merge_iou_threshold,
         class_agnostic=config.class_agnostic_merge,
+        tile_ids=detection_result.tile_ids,
+        tile_rects=detection_result.tile_rects,
+        seam_margin=seam_margin,
+        nms_metric=config.nms_metric,
+        containment_threshold=config.containment_threshold,
     )
     merged = filter_oversized_boxes(
         merged,

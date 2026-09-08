@@ -1,0 +1,13 @@
+.git
+.github
+.pytest_cache
+.venv
+__pycache__
+benchmarks
+data
+eval
+models
+outputs
+tests
+*.egg-info
+*.part

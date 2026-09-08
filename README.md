@@ -17,38 +17,51 @@ with the image's filename stem — no per-image subfolders):
 - `<stem>_detections.json` with box, score, and mask polygon per fruit, each
   keyed by a stable `instance_id`
 
-It intentionally stops there. Classification, sizing, and rotten/fine
-detection are separate future stages — see "Next stages" below.
+Physical sizing is available as a separate, opt-in calibrated stage. It is
+not run by normal detection/segmentation inference and measures only the
+fruit projection on the pallet plane (not fruit height or 3D volume).
 
-## How it works
+## Project structure
 
 ```
-detect.py     SAHI slices the image into tiles, runs an Ultralytics detector
-              on each tile + one full-image pass, shifts boxes back to
-              original coordinates. No merging happens here — it logs the
-              raw (pre-merge) detection count for debugging.
-merge.py      Combines overlapping raw detections with SAHI's Greedy NMM
-              (merges touching/adjacent fruit instead of deleting them, unlike
-              plain NMS), then drops boxes implausibly larger than the median
-              fruit box (heuristic for "boxed the whole crate, not one fruit").
-segment.py    Prompts SAM with each merged box (predictor.predict_torch,
-              multimask_output=False) — never SamAutomaticMaskGenerator — to
-              get exactly one mask per fruit. Then drops near-zero-area
-              masks, masks that hug an entire image edge (background/crate
-              wall), and (optionally) masks with an implausible aspect ratio.
-visualize.py  Draws the final boxes+mask overlay, and the per-tile debug grid.
-pipeline.py   Orchestrates the above and writes <stem>_detections.json,
-              <stem>_final.png, and <stem>_tiles.png.
-cli.py        argparse entrypoint.
+src/fruit_pipeline/
+├── detection/       detector backends, SAHI tiling, and cross-tile merging
+├── segmentation/    SAM loading, box prompting, and mask filters
+├── visualization/   final overlays and tile-debug rendering
+├── config/          prompt loading and packaged YAML defaults
+├── eval/            COCO adapters, metrics, and evaluation CLI
+├── camera_calibration/ standalone checkerboard/ChArUco calibration + store
+├── pallet_geometry/ four-keypoint detector interface, config, and homography
+├── measurement/     mask contour transformation and physical measurements
+├── size_estimation/ calibrated downstream sizing orchestration
+├── utils/           shared geometry and path helpers
+├── pipeline.py      end-to-end orchestration for one image
+├── cli.py           full-pipeline command
+└── inference.py     standalone whole-image inference command
+scripts/             dataset and annotation utilities
+tests/               unit and CLI tests
 ```
+
+The short modules such as `fruit_pipeline.detect` and
+`fruit_pipeline.merge` are compatibility imports. New features should use
+the focused subpackages, for example
+`fruit_pipeline.detection.tiling` and
+`fruit_pipeline.detection.merging`.
 
 ## Setup
 
-### 1. Install dependencies
+### 1. Install the project
 
 ```bash
-pip install -r requirements.txt
+pip install -e .
 ```
+
+For evaluation or development tools, use `pip install -e '.[eval]'` or
+`pip install -e '.[dev]'` respectively. The editable install exposes the
+`fruit-pipeline`, `fruit-inference`, and `fruit-eval` commands.
+SAM is installed from Meta's official GitHub repository, matching its
+upstream installation guidance rather than relying on an unrelated PyPI
+package with a similar name.
 
 ### 2. Model weights (reuse what's already downloaded in this project)
 
@@ -77,7 +90,7 @@ and want true open-vocabulary prompting.
 SAM2 was not used here even though the repo has a `sam2.1_t.pt` checkpoint,
 because the `sam2` package (plus its Hydra config files) isn't installed in
 this environment, while `segment-anything` (SAM1) and a matching ViT-L
-checkpoint already are. Swapping `segment.py`'s `load_sam` for a SAM2
+checkpoint already are. Swapping `segmentation/sam.py`'s `load_sam` for a SAM2
 loader later is a contained change if that's ever worth it.
 
 ## Run
@@ -88,6 +101,118 @@ python -m fruit_pipeline.cli --image path/to/image.jpg --output_dir ./out
 
 Produces `out/<stem>_detections.json`, `out/<stem>_final.png`, and
 `out/<stem>_tiles.png`, and prints the total fruit count to the console.
+
+## Calibrated fruit sizing
+
+For the complete, evolving workflow—including image capture, calibration
+commands and output locations, pallet-model TODOs, homography parameters, and
+size-estimation integration—see the
+[camera calibration and fruit sizing tutorial](docs/calibration/README.md).
+To validate sizing now with clicked pallet/object points, use the
+[manual pallet-plane size workflow](docs/manual_size_validation.md). The
+manual corner source implements the same `PalletDetector` protocol intended
+for a future keypoint model.
+
+Calibrate each camera independently from a folder, video, camera device, or
+RTSP source. For a 9x6 checkerboard (inner-corner counts) with 25 mm squares:
+
+```bash
+python calibrate_camera.py \
+  --camera-id cam_001 \
+  --camera-group camera_model_A \
+  --images calibration/cam_001/ \
+  --columns 9 --rows 6 --square-size-mm 25
+```
+
+Use `--board charuco --marker-size-mm 18` for ChArUco. A shared calibration
+can be saved with `--save-as-group`; loading always checks
+`calibrations/cameras/<camera_id>.json` first, then
+`calibrations/groups/<camera_group>.json`. Missing calibration, mismatched
+resolution, excessive reprojection error, malformed pallet corners,
+degenerate homographies, and low-confidence pallet detections fail clearly.
+Video, RTSP, and camera-device inputs sample every tenth frame by default and
+stop after 100 samples; tune these with `--frame-step` and
+`--max-sampled-frames`.
+
+Pallet sizes are independent of calibration; see `config/pallet_types.yaml`.
+The replaceable `PalletDetector` interface must return four labelled keypoints
+in `top-left, top-right, bottom-right, bottom-left` order. Construct
+`SizeEstimationPipeline` with that detector and pass it the existing
+`FruitInstance` masks. In debug mode its result includes a corner/mask/size
+overlay and a rectified pallet image, and `result.save(...)` writes those plus
+the millimetre measurements JSON.
+
+Length and width come from a rotated minimum-area rectangle after every mask
+contour point has been undistorted and transformed to pallet-local millimetres.
+Area and equivalent diameter are likewise planar projected measurements. No
+single global `mm_per_pixel` scale is used.
+
+### Connected counting and sizing pipeline
+
+`fruit-size-pipeline` connects pallet setup, tiled detection, SAM masks, fruit
+counting, and calibrated measurement. Every run asks for the target pallet
+corners in `TL, TR, BR, BL` order, then saves both the corner JSON and a preview
+before loading the inference models. For a headless dashboard, send the same
+four points through `--pallet-points-file`. Add `--reuse-pallet-selection`
+only when intentionally reusing an existing saved selection.
+
+```bash
+fruit-size-pipeline \
+  --image data/frame_001.jpg \
+  --output_dir outputs/sized \
+  --camera-id cam_001 \
+  --calibration-dir calibrations \
+  --pallet-type standard_large
+```
+
+The same command accepts a video. It processes every tenth frame by default;
+change that with `--frame-step` and optionally cap work with `--max-frames`:
+
+```bash
+fruit-size-pipeline \
+  --image data/line.mp4 \
+  --output_dir outputs/line \
+  --camera-id cam_001 \
+  --calibration-dir calibrations \
+  --pallet-type standard_large \
+  --frame-step 10
+```
+
+After detection, only fruit masks with at least 50% of their area inside the
+selected pallet polygon are counted and measured. Change this threshold with
+`--min-pallet-overlap`. The top-level `<source>_summary.json` contains a result
+per sampled frame: `num_fruits` is the selected-region count,
+`full_image_num_fruits` is diagnostic, and `num_measured_fruits` reports
+successful measurements. Each retained fruit includes width, length,
+projected area, and equivalent diameter in millimetres. Video frame artifacts
+are stored under `frames/frame_<index>/`. The future pallet model can replace
+the manual provider through the existing `PalletDetector` interface.
+
+As a temporary compatibility measure, `--resize-to-calibration` normalizes an
+input to the stored calibration resolution before pallet setup and inference.
+It can automatically rotate a landscape 4:3 input to a portrait 3:4
+calibration, then resize it. Use `--input-rotation clockwise` or
+`counterclockwise` when automatic orientation is wrong. The command refuses
+to stretch mismatched aspect ratios. This mode is only geometrically valid
+when the input uses the same camera view, aspect ratio, and crop as the
+calibration; calibration at the actual production resolution remains the
+preferred solution.
+
+### Whole-image detector inference (no tiling)
+
+To inspect the detector's predictions on the complete image without SAHI,
+merging, or SAM segmentation, use the standalone inference command:
+
+```bash
+python -m fruit_pipeline.inference \
+  --image path/to/image.jpg \
+  --weights models/best.pt \
+  --conf-threshold 0.25 \
+  --output-dir outputs/whole_image
+```
+
+`--image` may also be a directory (processed non-recursively). For every
+input, this writes `<stem>_prediction.jpg` and `<stem>_detections.json`.
 
 ### Batch mode (a folder of images)
 
@@ -261,8 +386,109 @@ batch.
   detector's box is; a loose box (covering part of a neighboring fruit) can
   make SAM bleed the mask into the neighbor.
 
+## Running command
+
+```
+python -m fruit_pipeline.cli \                        
+  --image data/test_fruits_HD \
+  --output_dir outputs/yolo/adaptive_gpu_test \
+  --detector-weights models/yolo11x.pt \
+  --sam-checkpoint models/sam_vit_l_0b3195.pth \
+  --device cuda:0 \
+  --sam-batch-size 1 \
+  --tile-size-k 8 \
+  --min-tile-size 320 \
+  --max-tile-size 2048 \
+  --max-tiles 12 \
+  --overlap-ratio 0.15 \
+  --nms-metric diou \
+  --merge-iou-threshold 0.5 \
+  --containment-threshold 0 \
+  --conf-threshold 0.05 \
+  -v
+```
+
+# fruit-detect-size-pipline
+
+## Running command
+
+```
+fruit-size-pipeline \                                     
+  --image data/calibration/cam_iphone/samples/pexels-enginakyurt-38571540.jpg \
+  --output_dir outputs/video \
+  --camera-id cam_iphone \
+  --calibration-dir outputs/calibrations/camera_model_A/cam_iphone \
+  --pallet-type standard_large \
+  --max-calibration-error 3.0 \
+  --resize-to-calibration \
+  --frame-step 10 \
+  --min-pallet-overlap 0.5 \
+  --detector-weights models/yolo11x.pt \
+  --sam-checkpoint models/sam_vit_l_0b3195.pth \
+  --device cpu \
+  --sam-batch-size 1 \
+  --tile-size-k 8 \
+  --min-tile-size 320 \
+  --max-tile-size 2048 \
+  --max-tiles 12 \
+  --overlap-ratio 0.15 \
+  --nms-metric diou \
+  --merge-iou-threshold 0.5 \
+  --containment-threshold 0 \
+  --conf-threshold 0.05 \
+  -v
+```
+
+
+### Dashboard API and container
+
+Install the API extra and start the calibration/analysis adapter on port 8010:
+
+```bash
+pip install -e '.[api]'
+uvicorn fruit_pipeline.dashboard_api:app --host 0.0.0.0 --port 8010
+```
+
+The API accepts calibration captures asynchronously, stores camera calibration
+JSON under `FRUIT_PIPELINE_DATA_DIR`, prepares the first image/video frame for
+four-corner pallet selection, and runs `fruit-size-pipeline` as a background
+job. `Dockerfile` packages the same API for CI/CD without embedding model
+weights. At deployment time, mount a host directory at `/models` containing:
+
+```text
+yolo11x.pt
+sam_vit_l_0b3195.pth
+```
+
+The container reads them from `/models/yolo11x.pt` and
+`/models/sam_vit_l_0b3195.pth`. The `/health` response reports
+`models_ready: true` after both files are mounted. This keeps the container
+image small and means GitHub Actions does not upload or download model files.
+
+The image pins PyTorch and defaults to its CUDA 11.8 wheel for broad NVIDIA
+driver compatibility (Linux driver 450.80.02 or newer). The host still needs
+an NVIDIA GPU, a compatible NVIDIA driver, and NVIDIA Container Toolkit; the
+container uses the host driver and cannot replace it. Newer CUDA wheel families
+supported by the pinned PyTorch release can be selected at build time without
+editing the Dockerfile:
+
+```bash
+docker build \
+  --build-arg PYTORCH_CUDA_FLAVOR=cu121 \
+  -t fruit-pipeline:cu121 .
+```
+
+Keep `FRUIT_PIPELINE_DEVICE=cuda` to require GPU inference. If the host driver,
+container runtime, and selected wheel are incompatible, the job fails instead
+of silently running SAM on the CPU. To verify a deployment before submitting a
+job:
+
+```bash
+docker compose exec fruit-pipeline python -c \
+  "import torch; print(torch.__version__, torch.version.cuda); assert torch.cuda.is_available(); print(torch.cuda.get_device_name())"
+```
+
 ## Next stages (not implemented here)
 
-Classification (fruit type), sizing, and rotten/fine detection are meant to
-be separate modules that consume `detections.json` from this stage, joining
-on each record's `instance_id`. Nothing here needs to change to add them.
+Fruit-type classification and rotten/fine quality detection can be added as
+separate modules that join on each result's `instance_id`.

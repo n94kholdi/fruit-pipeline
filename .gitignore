@@ -1,2 +1,19 @@
 outputs/
 models/
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Environments
+.venv/
+
+# Editor
+.vscode/
+
+# Model weights
+*.pt
+__pycache__/cli.cpython-310.pyc
