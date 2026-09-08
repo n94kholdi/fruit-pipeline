@@ -83,5 +83,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=fruit-pipeline
-          cache-to: type=gha,mode=max,scope=fruit-pipeline
+          # This is a single-stage image, so min preserves all reusable final
+          # layers without exporting extra intermediate BuildKit cache records.
+          cache-to: type=gha,mode=min,scope=fruit-pipeline
           build-args: VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
