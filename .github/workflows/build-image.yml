@@ -25,11 +25,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: "3.11"
           cache: pip
-      - run: python -m pip install ".[api,dev]"
-      - run: pytest -q
+      - name: Restore test environment
+        id: test-venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: ${{ runner.os }}-python-${{ steps.python.outputs.python-version }}-test-venv-v1-${{ hashFiles('pyproject.toml') }}
+      - name: Install test dependencies
+        if: steps.test-venv.outputs.cache-hit != 'true'
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install \
+            "torch==2.5.1" \
+            "torchvision==0.20.1" \
+            --index-url https://download.pytorch.org/whl/cpu
+          .venv/bin/python -m pip install --editable ".[api,dev]"
+      - name: Refresh editable project install
+        run: .venv/bin/python -m pip install --no-deps --editable .
+      - run: .venv/bin/pytest -q
 
   build-and-push:
     if: github.event_name != 'pull_request'
@@ -64,6 +82,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=fruit-pipeline
+          cache-to: type=gha,mode=max,scope=fruit-pipeline
           build-args: VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
