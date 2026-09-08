@@ -52,6 +52,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            type=ref,event=branch
             type=raw,value=dashoard-integration,enable=${{ github.ref == 'refs/heads/dashoard-integration' }}
             type=raw,value=${{ github.sha }}
             type=sha,format=short,prefix=sha-
