@@ -25,6 +25,9 @@ from fruit_pipeline.pallet_geometry.detector import (
     PalletGeometryError,
 )
 from fruit_pipeline.pipeline import PipelineConfig, load_models, run_pipeline
+from fruit_pipeline.sam_only_pipeline import SamOnlyConfig
+from fruit_pipeline.sam_only_pipeline import load_models as load_sam_only_models
+from fruit_pipeline.sam_only_pipeline import run_sam_only_pipeline
 from fruit_pipeline.segmentation.sam import FruitInstance
 from fruit_pipeline.size_estimation.manual_selection import load_points, select_points
 from fruit_pipeline.size_estimation.pipeline import (
@@ -52,10 +55,20 @@ def media_source_stem(source: str | Path) -> str:
 
 @dataclass(frozen=True)
 class IntegratedPipelineConfig:
-    detection: PipelineConfig
+    """Sizing config plus exactly one inference backend's config.
+
+    Set ``detection`` (a ``PipelineConfig``) for the original detector +
+    box-prompted-SAM pipeline, or ``sam_only`` (a ``SamOnlyConfig``) for the
+    detector-free path where SAM's own automatic mask generator proposes and
+    segments every instance. Exactly one of the two must be provided --
+    ``inference_mode`` reports which.
+    """
+
     sizing: SizeEstimationConfig
     pallet_type: str
     pallet_selection_path: str | Path
+    detection: PipelineConfig | None = None
+    sam_only: SamOnlyConfig | None = None
     pallet_points_file: str | Path | None = None
     frame_step: int = 10
     max_frames: int | None = None
@@ -65,6 +78,21 @@ class IntegratedPipelineConfig:
     input_rotation: str = "auto"
     reuse_pallet_selection: bool = False
     min_pallet_overlap: float = 0.5
+
+    def __post_init__(self) -> None:
+        if (self.detection is None) == (self.sam_only is None):
+            raise ValueError(
+                "IntegratedPipelineConfig requires exactly one of 'detection' or 'sam_only'"
+            )
+
+    @property
+    def inference_mode(self) -> str:
+        return "sam_only" if self.sam_only is not None else "detector"
+
+    @property
+    def output_dir(self) -> str:
+        active = self.sam_only if self.sam_only is not None else self.detection
+        return active.output_dir
 
 
 @dataclass
@@ -192,8 +220,11 @@ class IntegratedFruitSizingPipeline:
         pallet_detector: PalletDetector | None = None,
         detector=None,
         sam_predictor=None,
+        sam_generator=None,
         model_loader: Callable[[PipelineConfig], tuple[object, object]] = load_models,
         detection_runner: Callable[..., list[FruitInstance]] = run_pipeline,
+        sam_only_model_loader: Callable[[SamOnlyConfig], object] = load_sam_only_models,
+        sam_only_runner: Callable[..., list[FruitInstance]] = run_sam_only_pipeline,
         frame_processed: FrameProcessedCallback | None = None,
     ) -> None:
         if config.frame_step <= 0:
@@ -213,8 +244,11 @@ class IntegratedFruitSizingPipeline:
         self._pallet_detector_injected = pallet_detector is not None
         self.detector = detector
         self.sam_predictor = sam_predictor
+        self.sam_generator = sam_generator
         self._model_loader = model_loader
         self._detection_runner = detection_runner
+        self._sam_only_model_loader = sam_only_model_loader
+        self._sam_only_runner = sam_only_runner
         self._frame_processed = frame_processed
         self._sizing_pipeline: SizeEstimationPipeline | None = None
         self._calibration_resolution: tuple[int, int] | None = None
@@ -301,7 +335,7 @@ class IntegratedFruitSizingPipeline:
         image = self._normalize_frame(image)
         processing_path = path
         if image.shape[:2] != original_shape:
-            input_dir = Path(self.config.detection.output_dir) / "normalized_inputs"
+            input_dir = Path(self.config.output_dir) / "normalized_inputs"
             input_dir.mkdir(parents=True, exist_ok=True)
             processing_path = input_dir / f"{path.stem}.png"
             if not cv2.imwrite(str(processing_path), image):
@@ -313,11 +347,11 @@ class IntegratedFruitSizingPipeline:
             processing_path,
             None,
             None,
-            Path(self.config.detection.output_dir),
+            Path(self.config.output_dir),
         )
         self._notify_frame(frame, image, 1, 1)
         result = MediaResult(str(path), str(self.config.pallet_selection_path), [frame])
-        result.save(Path(self.config.detection.output_dir) / f"{path.stem}_summary.json")
+        result.save(Path(self.config.output_dir) / f"{path.stem}_summary.json")
         return result
 
     def run_video(self, video_path: str | Path) -> MediaResult:
@@ -356,7 +390,7 @@ class IntegratedFruitSizingPipeline:
                 if frame_index % self.config.frame_step == 0:
                     processing_frame = self._normalize_frame(frame)
                     artifact_dir = (
-                        Path(self.config.detection.output_dir)
+                        Path(self.config.output_dir)
                         / "frames"
                         / f"frame_{frame_index:06d}"
                     )
@@ -386,7 +420,7 @@ class IntegratedFruitSizingPipeline:
             capture.release()
 
         result = MediaResult(source, str(self.config.pallet_selection_path), frames)
-        result.save(Path(self.config.detection.output_dir) / f"{stem}_summary.json")
+        result.save(Path(self.config.output_dir) / f"{stem}_summary.json")
         return result
 
     def _notify_frame(
@@ -436,7 +470,11 @@ class IntegratedFruitSizingPipeline:
         return normalized
 
     def _ensure_models(self, image_path: str) -> None:
-        if self.detector is None or self.sam_predictor is None:
+        if self.config.inference_mode == "sam_only":
+            if self.sam_generator is None:
+                model_config = replace(self.config.sam_only, image_path=image_path)
+                self.sam_generator = self._sam_only_model_loader(model_config)
+        elif self.detector is None or self.sam_predictor is None:
             model_config = replace(self.config.detection, image_path=image_path)
             self.detector, self.sam_predictor = self._model_loader(model_config)
 
@@ -449,16 +487,27 @@ class IntegratedFruitSizingPipeline:
         artifact_dir: Path,
     ) -> FrameResult:
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        detection_config = replace(
-            self.config.detection,
-            image_path=str(image_path),
-            output_dir=str(artifact_dir),
-        )
-        full_image_instances = self._detection_runner(
-            detection_config,
-            detector=self.detector,
-            sam_predictor=self.sam_predictor,
-        )
+        if self.config.inference_mode == "sam_only":
+            inference_config = replace(
+                self.config.sam_only,
+                image_path=str(image_path),
+                output_dir=str(artifact_dir),
+            )
+            full_image_instances = self._sam_only_runner(
+                inference_config,
+                generator=self.sam_generator,
+            )
+        else:
+            detection_config = replace(
+                self.config.detection,
+                image_path=str(image_path),
+                output_dir=str(artifact_dir),
+            )
+            full_image_instances = self._detection_runner(
+                detection_config,
+                detector=self.detector,
+                sam_predictor=self.sam_predictor,
+            )
         pallet_detection = self.pallet_detector.detect(image_bgr)
         if pallet_detection is None:
             raise PalletGeometryError("No pallet detected while filtering fruit")
