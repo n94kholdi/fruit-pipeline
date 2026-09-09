@@ -59,21 +59,21 @@ pip install -e .
 For evaluation or development tools, use `pip install -e '.[eval]'` or
 `pip install -e '.[dev]'` respectively. The editable install exposes the
 `fruit-pipeline`, `fruit-inference`, and `fruit-eval` commands.
-SAM1 and the pinned SAM2 implementation are installed from Meta's official GitHub repositories, matching their
-upstream installation guidance rather than relying on an unrelated PyPI
-package with a similar name.
+The pinned SAM2 implementation is installed from Meta's official GitHub
+repository, matching its upstream installation guidance rather than relying on
+an unrelated PyPI package with a similar name.
 
 ### 2. Model weights (reuse what's already downloaded in this project)
 
 | Model | Used for | Where this project already has it |
 |---|---|---|
 | A standard Ultralytics YOLO checkpoint (`yolo11x.pt`, `yolov8x.pt`, `models/yolo11m.pt`, `models/yolov8m.pt`, ...) | tiled object-like-region detector (class-agnostic) | project root / `models/` |
-| SAM ViT-L checkpoint (`sam_vit_l_0b3195.pth`) | box-prompted segmentation | `models/sam_vit_l_0b3195.pth` |
-| One selected SAM2.1 Hiera checkpoint | automatic discovery plus video propagation | mounted under `/models` |
+| One selected SAM2.1 Hiera checkpoint | box-prompted segmentation (`detector`) plus automatic discovery / video propagation (`sam2_video`) | mounted under `/models` |
 
-Defaults (`--detector-weights yolo11x.pt`, `--sam-checkpoint
-models/sam_vit_l_0b3195.pth`) point at checkpoints already present in this
-project, so no downloads are required to run it as-is.
+Defaults (`--detector-weights yolo11x.pt`) point at checkpoints already
+present in this project, so no downloads are required to run it as-is. Both
+remaining inference modes share a single resident SAM2 model, so only one
+SAM2 checkpoint is ever loaded into VRAM.
 
 **YOLO-World is optional, not the default.** The prompt spec's first choice
 for the detector is an open-vocabulary model like YOLO-World, prompted with
@@ -94,8 +94,9 @@ and want true open-vocabulary prompting.
 refresh frames, then propagates all active masks with `SAM2VideoPredictor` on
 intermediate processed frames. Discovery and propagation share one resident
 model. Stable IDs are reconciled with mask IoU, box IoU, and normalized
-centroid distance. SAM1 `sam_only` and `detector` remain available and the
-default remains `sam_only`.
+centroid distance. In `detector` mode the same resident SAM2 model is driven
+with box prompts produced by the YOLO detector, so both modes share one
+model. `detector` is the default and `sam2_video` remains selectable.
 
 The backend and model size are container-start settings. They are deliberately
 not per-dashboard-job settings because changing them would temporarily keep
@@ -158,7 +159,6 @@ container process:
 ```bash
 SAM2_PRECISION=bf16 FRUIT_PIPELINE_SAM2_MODEL=sam2.1_hiera_base_plus \
 python scripts/benchmark_sam2.py production-video.mp4 --frame-step 10 --max-processed-frames 100
-python scripts/benchmark_sam.py production-frame.jpg --checkpoint /models/sam_vit_l_0b3195.pth
 ```
 
 Repeat for Tiny, Small, Base+, and Large and for 1/2/4/8 concurrent streams.
@@ -407,42 +407,23 @@ batch.
   larger than this multiple of the median detected box area in the image).
 
 **Segmentation**
-- `--sam-checkpoint` (default `models/sam_vit_l_0b3195.pth`).
-- `--sam-model-type` (default `vit_l`): `vit_b` (fastest, lowest quality),
-  `vit_l` (default, balanced), or `vit_h` (best quality, slowest/heaviest).
-- `--sam-batch-size` (default `16`): boxes per batched SAM `predict_torch`
-  call; raise/lower based on available GPU/CPU memory.
-- `--sam-fp16` / `--no-sam-fp16` (default: enabled): control CUDA FP16
-  autocast. `FRUIT_PIPELINE_SAM_USE_FP16=false` changes the default without
-  changing command lines. CPU inference always uses FP32.
+- `--sam-batch-size` (default `16`): boxes per batched SAM2 box-prompt call;
+  raise/lower based on available GPU/CPU memory.
 
-### Persistent SAM runtime and benchmarking
+### Persistent SAM2 runtime and benchmarking
 
-SAM is owned by a process-wide `SAMModelManager`, keyed by checkpoint, model
-type, device, and precision. The checkpoint is loaded once, gradients are
-disabled, and the GPU-resident model is reused. Image encoding and prompt
-decoding are separate calls, so a later video pipeline can retain embeddings
-or insert tracking and periodic SAM refreshes without changing application
-logic. The manager serializes access to the predictor's mutable image state.
+The `detector` and `sam2_video` modes share one process-wide resident SAM2
+model (`SAM2ModelManager`). The checkpoint is loaded once, gradients are
+disabled, and the GPU-resident model is reused. In `detector` mode the very
+same model is driven through `SAM2ImagePredictor` with YOLO box prompts; in
+`sam2_video` mode it performs automatic discovery and video propagation. The
+manager serializes access to the predictor's mutable state, so a single
+checkpoint is ever in VRAM regardless of which mode or how many streams run.
 
-For an RTX A6000 deployment, use `FRUIT_PIPELINE_DEVICE=cuda` and leave
-`FRUIT_PIPELINE_SAM_USE_FP16=true`. To compare cold FP32 behavior with the
-persistent FP16 path on a representative image and prompt boxes:
-
-```bash
-python scripts/benchmark_sam.py \
-  --image data/example.jpg \
-  --boxes-json outputs/example_detections.json \
-  --device cuda \
-  --iterations 5 \
-  --output benchmarks/sam_a6000.json
-```
-
-The report includes model loading, preprocessing, image encoder, prompt
-encoder, mask decoder, postprocessing, total inference, effective FPS, and
-peak allocated/reserved GPU memory. CUDA synchronization is enabled only in this
-profiling utility, not in normal inference. It also reports mask IoU, pixel
-agreement, and score drift between FP32 and the selected optimized precision.
+For an RTX A6000 deployment, set `FRUIT_PIPELINE_DEVICE=cuda` and choose the
+SAM2 variant and precision via `FRUIT_PIPELINE_SAM2_MODEL` and
+`SAM2_PRECISION`. Benchmark discovery/propagation capacity and VRAM with
+`scripts/benchmark_sam2.py`:
 
 **Mask sanity filters**
 - `--min-mask-area` (default `30` px): drop degenerate near-zero-area masks.
@@ -499,7 +480,6 @@ python -m fruit_pipeline.cli \
   --image data/test_fruits_HD \
   --output_dir outputs/yolo/adaptive_gpu_test \
   --detector-weights models/yolo11x.pt \
-  --sam-checkpoint models/sam_vit_l_0b3195.pth \
   --device cuda:0 \
   --sam-batch-size 1 \
   --tile-size-k 8 \
@@ -530,7 +510,6 @@ fruit-size-pipeline \
   --frame-step 10 \
   --min-pallet-overlap 0.5 \
   --detector-weights models/yolo11x.pt \
-  --sam-checkpoint models/sam_vit_l_0b3195.pth \
   --device cpu \
   --sam-batch-size 1 \
   --tile-size-k 8 \
@@ -563,11 +542,11 @@ weights. At deployment time, mount a host directory at `/models` containing:
 
 ```text
 yolo11x.pt
-sam_vit_l_0b3195.pth
+sam2.1_hiera_base_plus.pt
 ```
 
 The container reads them from `/models/yolo11x.pt` and
-`/models/sam_vit_l_0b3195.pth`. The `/health` response reports
+`/models/sam2.1_hiera_base_plus.pt`. The `/health` response reports
 `models_ready: true` after both files are mounted. This keeps the container
 image small and means GitHub Actions does not upload or download model files.
 

@@ -1,10 +1,9 @@
-"""SAM box-prompted segmentation.
+"""SAM2 box-prompted fruit segmentation.
 
-Every mask is produced by prompting SAM with one merged detection box
-(`predictor.predict_torch(boxes=..., multimask_output=False)`), never with
-``SamAutomaticMaskGenerator``. This keeps segmentation strictly
-detection-driven so background, stems, and shadows are never proposed as
-separate "objects" the way automatic mask generation would.
+Every mask is produced by prompting the resident SAM2 model with one merged
+detection box (``SAM2ImagePredictor.predict(box=..., multimask_output=False)``).
+Segmentation stays strictly detection-driven so background, stems, and shadows
+are never proposed as separate "objects".
 """
 
 from __future__ import annotations
@@ -16,18 +15,13 @@ from typing import Literal
 import numpy as np
 
 from fruit_pipeline.detection.merging import Detection
-from fruit_pipeline.segmentation.sam_manager import (
-    SAM_MODEL_TYPES,
-    SAMModelManager,
-    get_sam_model_manager,
-)
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class FruitInstance:
-    """A final per-fruit record: detection box + its SAM mask."""
+    """A final per-fruit record: detection box + its SAM2 mask."""
 
     instance_id: int
     box: list[float]
@@ -35,8 +29,8 @@ class FruitInstance:
     category_name: str
     sam_score: float
     mask: np.ndarray  # bool array, shape (H, W)
-    # Video lifecycle fields are optional so existing SAM1/detector callers and
-    # their positional constructor contract remain unchanged.
+    # Video lifecycle fields are optional so image callers and their positional
+    # constructor contract remain unchanged.
     confidence: float | None = None
     first_seen_frame: int | None = None
     last_seen_frame: int | None = None
@@ -45,32 +39,8 @@ class FruitInstance:
 
     @property
     def bbox(self) -> list[float]:
-        """Backward-compatible SAM2 name for the existing ``box`` field."""
+        """Alias for the existing ``box`` field."""
         return self.box
-
-
-def load_sam(
-    checkpoint: str,
-    model_type: str = "vit_l",
-    device: str = "cpu",
-    use_fp16: bool = True,
-):
-    """Load a pretrained SAM checkpoint and return a ``SamPredictor``.
-
-    No automatic mask generator is created here on purpose (see module
-    docstring) — only the predictor, which is driven by explicit box prompts.
-    """
-    return get_sam_model_manager(checkpoint, model_type, device, use_fp16).get_predictor()
-
-
-def load_sam_manager(
-    checkpoint: str,
-    model_type: str = "vit_l",
-    device: str = "cpu",
-    use_fp16: bool = True,
-) -> SAMModelManager:
-    """Load or reuse the persistent manager used by production pipelines."""
-    return get_sam_model_manager(checkpoint, model_type, device, use_fp16)
 
 
 def segment_boxes(
@@ -79,69 +49,35 @@ def segment_boxes(
     detections: list[Detection],
     batch_size: int = 16,
 ) -> list[FruitInstance]:
-    """Run box-prompted SAM segmentation for every detection, batched.
+    """Run box-prompted SAM2 segmentation for every detection, batched.
 
-    The image embedding is computed once via ``set_image``; boxes are then
-    fed through ``predict_torch`` in chunks of ``batch_size`` so 100+ boxes
-    per image don't require 100+ separate forward passes through the encoder.
+    The image embedding is computed once via ``set_image``; boxes are then fed
+    through ``SAM2ImagePredictor.predict`` in chunks of ``batch_size`` so many
+    boxes per image don't require a full image-encoder pass for each.
     """
     if not detections:
         return []
 
     boxes_np = np.array([det.box for det in detections], dtype=np.float32)
+    masks, scores = predictor.segment_boxes(
+        image_rgb,
+        boxes_np,
+        batch_size=batch_size,
+    )
+
     instances: list[FruitInstance] = []
-
-    if isinstance(predictor, SAMModelManager):
-        result = predictor.run_inference(image_rgb, boxes_np, batch_size=batch_size)
-        for det, mask, sam_score in zip(detections, result.masks, result.scores):
-            instances.append(
-                FruitInstance(
-                    instance_id=det.instance_id,
-                    box=det.box,
-                    detector_score=det.score,
-                    category_name=det.category_name,
-                    sam_score=float(sam_score),
-                    mask=mask.astype(bool, copy=False),
-                )
+    for det, mask, sam_score in zip(detections, masks, scores):
+        instances.append(
+            FruitInstance(
+                instance_id=det.instance_id,
+                box=det.box,
+                detector_score=det.score,
+                category_name=det.category_name,
+                sam_score=float(sam_score),
+                mask=np.asarray(mask).astype(bool, copy=False),
             )
-        logger.info("SAM produced %d masks (batch_size=%d)", len(instances), batch_size)
-        return instances
-
-    # Compatibility path for callers that inject a raw SamPredictor.
-    import torch
-
-    predictor.set_image(image_rgb)
-    device = predictor.device
-    original_size = image_rgb.shape[:2]
-
-    with torch.inference_mode():
-        for start in range(0, len(detections), batch_size):
-            chunk_dets = detections[start : start + batch_size]
-            chunk_boxes = torch.as_tensor(boxes_np[start : start + batch_size], device=device)
-            transformed_boxes = predictor.transform.apply_boxes_torch(chunk_boxes, original_size)
-
-            masks, iou_predictions, _ = predictor.predict_torch(
-                point_coords=None,
-                point_labels=None,
-                boxes=transformed_boxes,
-                multimask_output=False,
-            )
-            masks = masks.squeeze(1).cpu().numpy()  # (chunk, H, W) bool
-            scores = iou_predictions.squeeze(1).cpu().numpy()
-
-            for det, mask, sam_score in zip(chunk_dets, masks, scores):
-                instances.append(
-                    FruitInstance(
-                        instance_id=det.instance_id,
-                        box=det.box,
-                        detector_score=det.score,
-                        category_name=det.category_name,
-                        sam_score=float(sam_score),
-                        mask=mask.astype(bool),
-                    )
-                )
-
-    logger.info("SAM produced %d masks (batch_size=%d)", len(instances), batch_size)
+        )
+    logger.info("SAM2 produced %d masks (batch_size=%d)", len(instances), batch_size)
     return instances
 
 
@@ -153,9 +89,9 @@ def filter_masks(
     aspect_ratio_filter_enabled: bool = True,
     max_aspect_ratio: float = 3.0,
 ) -> list[FruitInstance]:
-    """Sanity-filter SAM masks before they become final fruit instances.
+    """Sanity-filter SAM2 masks before they become final fruit instances.
 
-    - Drops near-zero-area masks (degenerate SAM output).
+    - Drops near-zero-area masks (degenerate output).
     - Drops masks that hug an entire image edge rather than just touching it,
       which is the signature of a background strip/crate wall getting
       segmented instead of a single (possibly edge-cropped) fruit.

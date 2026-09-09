@@ -30,8 +30,6 @@ from fruit_pipeline.camera_calibration.models import CalibrationError
 from fruit_pipeline.integrated_pipeline import media_source_stem, normalize_to_resolution
 from fruit_pipeline.live import FruitLiveReporter
 from fruit_pipeline.pallet_geometry.pallet_config import PalletTypeConfig
-from fruit_pipeline.pipeline import resolve_device
-from fruit_pipeline.segmentation.sam_manager import env_flag, get_sam_model_manager
 from fruit_pipeline.segmentation.sam2_config import SAM2Config
 from fruit_pipeline.segmentation.sam2_manager import get_sam2_model_manager
 
@@ -42,13 +40,10 @@ INPUT_DIR = DATA_DIR / "inputs"
 JOB_DIR = DATA_DIR / "jobs"
 PALLET_CONFIG = Path(os.getenv("FRUIT_PIPELINE_PALLET_CONFIG", "config/pallet_types.yaml")).resolve()
 DETECTOR_WEIGHTS = os.getenv("FRUIT_PIPELINE_DETECTOR_WEIGHTS", "models/yolo11x.pt")
-SAM_CHECKPOINT = os.getenv("FRUIT_PIPELINE_SAM_CHECKPOINT", "models/sam_vit_l_0b3195.pth")
 DEVICE = os.getenv("FRUIT_PIPELINE_DEVICE", "cpu")
-SAM_MODEL_TYPE = os.getenv("FRUIT_PIPELINE_SAM_MODEL_TYPE", "vit_l")
-SAM_USE_FP16 = env_flag("FRUIT_PIPELINE_SAM_USE_FP16", True)
-SERVICE_INFERENCE_MODE = os.getenv("FRUIT_PIPELINE_INFERENCE_MODE", "sam_only")
-if SERVICE_INFERENCE_MODE not in {"sam_only", "detector", "sam2_video"}:
-    raise ValueError("FRUIT_PIPELINE_INFERENCE_MODE must be sam_only, detector, or sam2_video")
+SERVICE_INFERENCE_MODE = os.getenv("FRUIT_PIPELINE_INFERENCE_MODE", "detector")
+if SERVICE_INFERENCE_MODE not in {"detector", "sam2_video"}:
+    raise ValueError("FRUIT_PIPELINE_INFERENCE_MODE must be detector or sam2_video")
 SAM2_CONFIG = SAM2Config.from_env()
 MAX_UPLOAD_BYTES = int(os.getenv("FRUIT_PIPELINE_MAX_UPLOAD_BYTES", str(1024**3)))
 WORKERS = max(1, int(os.getenv("FRUIT_PIPELINE_JOB_WORKERS", "1")))
@@ -64,15 +59,13 @@ def preload_sam_model() -> None:
         # Readiness failures are fatal by design when the SAM2 service is selected.
         get_sam2_model_manager(SAM2_CONFIG, eager=True)
         return
-    if not Path(SAM_CHECKPOINT).is_file():
-        logger.warning("SAM startup preload skipped; checkpoint is missing: %s", SAM_CHECKPOINT)
+    if not Path(SAM2_CONFIG.resolved_checkpoint).is_file():
+        logger.warning(
+            "SAM2 startup preload skipped; checkpoint is missing: %s",
+            SAM2_CONFIG.resolved_checkpoint,
+        )
         return
-    get_sam_model_manager(
-        SAM_CHECKPOINT,
-        model_type=SAM_MODEL_TYPE,
-        device=resolve_device(DEVICE),
-        use_fp16=SAM_USE_FP16,
-    )
+    get_sam2_model_manager(SAM2_CONFIG, eager=True)
 
 
 _sam2_cleanup_stop = threading.Event()
@@ -151,10 +144,9 @@ class FruitJobRequest(BaseModel):
     resize_to_calibration: bool = True
     allow_unsafe_resize: bool = False
     max_frames: int | None = Field(default=None, ge=1)
-    # "sam_only" (default): no detector -- SAM's own automatic mask generator
-    # proposes and segments every fruit. "detector": the original detector +
-    # box-prompted-SAM pipeline.
-    inference_mode: Literal["sam_only", "detector", "sam2_video"] = SERVICE_INFERENCE_MODE
+    # "detector": the original detector + box-prompted-SAM2 pipeline.
+    # "sam2_video": detector-free SAM2 video object discovery/tracking.
+    inference_mode: Literal["detector", "sam2_video"] = SERVICE_INFERENCE_MODE
 
 
 class StreamInputRequest(BaseModel):
@@ -480,8 +472,6 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
         "--live-job-id", job_id,
         "-v",
     ]
-    if request.inference_mode != "sam2_video":
-        command += ["--sam-checkpoint", SAM_CHECKPOINT]
     if request.inference_mode == "detector":
         command += [
             "--detector-weights", DETECTOR_WEIGHTS,
@@ -535,11 +525,9 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
 @app.get("/health")
 def health() -> dict[str, object]:
     detector_exists = Path(DETECTOR_WEIGHTS).is_file()
-    sam_exists = Path(SAM_CHECKPOINT).is_file()
     sam2_exists = Path(SAM2_CONFIG.resolved_checkpoint).is_file()
     selected_ready = {
-        "sam_only": sam_exists,
-        "detector": detector_exists and sam_exists,
+        "detector": detector_exists and sam2_exists,
         "sam2_video": sam2_exists,
     }[SERVICE_INFERENCE_MODE]
     payload = {
@@ -548,7 +536,6 @@ def health() -> dict[str, object]:
         "models_ready": selected_ready,
         "models": {
             "detector": detector_exists,
-            "sam": sam_exists,
             "sam2_selected": sam2_exists,
         },
     }
@@ -772,7 +759,7 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
         )
     required_models = (
         (SAM2_CONFIG.resolved_checkpoint,) if request.inference_mode == "sam2_video" else
-        ((SAM_CHECKPOINT,) if request.inference_mode == "sam_only" else (DETECTOR_WEIGHTS, SAM_CHECKPOINT))
+        (DETECTOR_WEIGHTS, SAM2_CONFIG.resolved_checkpoint)
     )
     missing_models = [path for path in required_models if not Path(path).is_file()]
     if missing_models:

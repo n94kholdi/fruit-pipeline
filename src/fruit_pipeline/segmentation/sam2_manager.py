@@ -68,6 +68,7 @@ class SAM2ModelManager:
         self.device = torch.device(config.device)
         self._predictor = predictor
         self._generator = generator
+        self._image_predictor = None
         self._load_lock = threading.Lock()
         self._discovery_slots = threading.BoundedSemaphore(config.max_concurrent_discoveries)
         self._states: dict[str, CameraVideoState] = {}
@@ -197,6 +198,53 @@ class SAM2ModelManager:
             self.load_time_ms = (time.perf_counter() - started) * 1000
             logger.info("Loaded %s once on %s in %.1f ms", self.config.model_name, self.device, self.load_time_ms)
             return predictor
+
+    def _get_image_predictor(self):
+        """A box-prompted image predictor sharing the resident SAM2 weights.
+
+        ``SAM2ImagePredictor`` wraps the same ``SAM2Base`` instance the video
+        predictor and automatic generator use, so detection-mode box-prompted
+        segmentation does not allocate a second model checkpoint in VRAM.
+        """
+        if self._image_predictor is None:
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+            model = self.load()
+            self._image_predictor = SAM2ImagePredictor(model)
+        return self._image_predictor
+
+    def segment_boxes(
+        self,
+        image_rgb: np.ndarray,
+        boxes: np.ndarray,
+        *,
+        batch_size: int = 16,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Box-prompted SAM2 segmentation of one RGB image.
+
+        Returns ``(masks, scores)`` where ``masks[i]`` is the boolean mask for
+        ``boxes[i]`` (``multimask_output=False``, single mask per box) and
+        ``scores[i]`` is SAM2's predicted mask-quality IoU. Runs ``segment_boxes``
+        under the manager's lock and precision context so it never races video
+        inference on the shared model.
+        """
+        predictor = self._get_image_predictor()
+        with self._load_lock, torch.inference_mode(), self._autocast():
+            predictor.set_image(image_rgb)
+            boxes_np = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+            mask_chunks: list[np.ndarray] = []
+            score_chunks: list[np.ndarray] = []
+            for start in range(0, len(boxes_np), batch_size):
+                masks, scores, _ = predictor.predict(
+                    box=boxes_np[start : start + batch_size],
+                    multimask_output=False,
+                )
+                mask_chunks.append(np.asarray(masks).squeeze(1))
+                score_chunks.append(np.asarray(scores).squeeze(1))
+            if not mask_chunks:
+                height, width = image_rgb.shape[:2]
+                return np.empty((0, height, width), dtype=bool), np.empty((0,), dtype=np.float32)
+            return np.concatenate(mask_chunks), np.concatenate(score_chunks)
 
     def start_camera(self, camera_id: str, source: str, frame_shape: tuple[int, int],
                      crop_box: tuple[int, int, int, int] | None = None,

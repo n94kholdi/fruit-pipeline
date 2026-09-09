@@ -30,25 +30,21 @@ def _fruit_job_request(**changes):
     return dashboard_api.FruitJobRequest(**values)
 
 
-def test_startup_preloads_the_persistent_sam_manager(tmp_path, monkeypatch):
-    checkpoint = tmp_path / "sam.pth"
+def test_startup_preloads_the_persistent_sam2_manager_for_detector(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "sam2.pt"
     checkpoint.touch()
+    config = SAM2Config(device="cpu", checkpoint=str(checkpoint))
     calls = []
-    monkeypatch.setattr(dashboard_api, "SAM_CHECKPOINT", str(checkpoint))
-    monkeypatch.setattr(dashboard_api, "SAM_MODEL_TYPE", "vit_l")
-    monkeypatch.setattr(dashboard_api, "SAM_USE_FP16", True)
-    monkeypatch.setattr(dashboard_api, "DEVICE", "cpu")
+    monkeypatch.setattr(dashboard_api, "SERVICE_INFERENCE_MODE", "detector")
+    monkeypatch.setattr(dashboard_api, "SAM2_CONFIG", config)
     monkeypatch.setattr(
-        dashboard_api,
-        "get_sam_model_manager",
+        dashboard_api, "get_sam2_model_manager",
         lambda *args, **kwargs: calls.append((args, kwargs)),
     )
 
     dashboard_api.preload_sam_model()
 
-    assert calls == [
-        ((str(checkpoint),), {"model_type": "vit_l", "device": "cpu", "use_fp16": True})
-    ]
+    assert calls == [((config,), {"eager": True})]
 
 
 def test_fruit_job_runs_in_process_to_reuse_startup_model(tmp_path, monkeypatch):

@@ -25,9 +25,6 @@ from fruit_pipeline.pallet_geometry.detector import (
     PalletGeometryError,
 )
 from fruit_pipeline.pipeline import PipelineConfig, load_models, run_pipeline
-from fruit_pipeline.sam_only_pipeline import SamOnlyConfig
-from fruit_pipeline.sam_only_pipeline import load_models as load_sam_only_models
-from fruit_pipeline.sam_only_pipeline import run_sam_only_pipeline
 from fruit_pipeline.segmentation.sam import FruitInstance
 from fruit_pipeline.segmentation.sam2_config import SAM2Config
 from fruit_pipeline.segmentation.sam2_manager import SAM2ModelManager, get_sam2_model_manager
@@ -60,17 +57,15 @@ class IntegratedPipelineConfig:
     """Sizing config plus exactly one inference backend's config.
 
     Set ``detection`` (a ``PipelineConfig``) for the original detector +
-    box-prompted-SAM pipeline, or ``sam_only`` (a ``SamOnlyConfig``) for the
-    detector-free path where SAM's own automatic mask generator proposes and
-    segments every instance. Exactly one of the two must be provided --
-    ``inference_mode`` reports which.
+    box-prompted-SAM2 pipeline, or ``sam2_video`` (a ``SAM2Config``) for the
+    detector-free video path where SAM2 discovers and propagates instances.
+    Exactly one of the two must be provided -- ``inference_mode`` reports which.
     """
 
     sizing: SizeEstimationConfig
     pallet_type: str
     pallet_selection_path: str | Path
     detection: PipelineConfig | None = None
-    sam_only: SamOnlyConfig | None = None
     sam2_video: SAM2Config | None = None
     pallet_points_file: str | Path | None = None
     frame_step: int = 10
@@ -83,24 +78,21 @@ class IntegratedPipelineConfig:
     min_pallet_overlap: float = 0.5
 
     def __post_init__(self) -> None:
-        if sum(item is not None for item in (self.detection, self.sam_only, self.sam2_video)) != 1:
+        if sum(item is not None for item in (self.detection, self.sam2_video)) != 1:
             raise ValueError(
-                "IntegratedPipelineConfig requires exactly one of 'detection', 'sam_only', or 'sam2_video'"
+                "IntegratedPipelineConfig requires exactly one of 'detection' or 'sam2_video'"
             )
 
     @property
     def inference_mode(self) -> str:
-        if self.sam2_video is not None:
-            return "sam2_video"
-        return "sam_only" if self.sam_only is not None else "detector"
+        return "sam2_video" if self.sam2_video is not None else "detector"
 
     @property
     def output_dir(self) -> str:
-        active = self.sam_only if self.sam_only is not None else self.detection
-        if active is None:
+        if self.detection is None:
             # SAM2 service configuration intentionally does not contain per-job paths.
             return str(Path(self.pallet_selection_path).parent)
-        return active.output_dir
+        return self.detection.output_dir
 
 
 @dataclass
@@ -235,12 +227,9 @@ class IntegratedFruitSizingPipeline:
         pallet_detector: PalletDetector | None = None,
         detector=None,
         sam_predictor=None,
-        sam_generator=None,
         sam2_manager: SAM2ModelManager | None = None,
         model_loader: Callable[[PipelineConfig], tuple[object, object]] = load_models,
         detection_runner: Callable[..., list[FruitInstance]] = run_pipeline,
-        sam_only_model_loader: Callable[[SamOnlyConfig], object] = load_sam_only_models,
-        sam_only_runner: Callable[..., list[FruitInstance]] = run_sam_only_pipeline,
         frame_processed: FrameProcessedCallback | None = None,
     ) -> None:
         if config.frame_step <= 0:
@@ -260,12 +249,9 @@ class IntegratedFruitSizingPipeline:
         self._pallet_detector_injected = pallet_detector is not None
         self.detector = detector
         self.sam_predictor = sam_predictor
-        self.sam_generator = sam_generator
         self.sam2_manager = sam2_manager
         self._model_loader = model_loader
         self._detection_runner = detection_runner
-        self._sam_only_model_loader = sam_only_model_loader
-        self._sam_only_runner = sam_only_runner
         self._frame_processed = frame_processed
         self._sizing_pipeline: SizeEstimationPipeline | None = None
         self._calibration_resolution: tuple[int, int] | None = None
@@ -348,7 +334,7 @@ class IntegratedFruitSizingPipeline:
 
     def run_image(self, image_path: str | Path) -> MediaResult:
         if self.config.inference_mode == "sam2_video":
-            raise ValueError("sam2_video requires a video or live stream; use sam_only for a still image")
+            raise ValueError("sam2_video requires a video or live stream; use detection for a still image")
         path = Path(image_path)
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None:
@@ -516,10 +502,6 @@ class IntegratedFruitSizingPipeline:
         if self.config.inference_mode == "sam2_video":
             if self.sam2_manager is None:
                 self.sam2_manager = get_sam2_model_manager(self.config.sam2_video)
-        elif self.config.inference_mode == "sam_only":
-            if self.sam_generator is None:
-                model_config = replace(self.config.sam_only, image_path=image_path)
-                self.sam_generator = self._sam_only_model_loader(model_config)
         elif self.detector is None or self.sam_predictor is None:
             model_config = replace(self.config.detection, image_path=image_path)
             self.detector, self.sam_predictor = self._model_loader(model_config)
@@ -543,16 +525,6 @@ class IntegratedFruitSizingPipeline:
             logger.info(
                 "SAM2 frame %s: discovery=%.1fms propagation=%.1fms",
                 frame_index, timing.discovery_ms, timing.propagation_ms,
-            )
-        elif self.config.inference_mode == "sam_only":
-            inference_config = replace(
-                self.config.sam_only,
-                image_path=str(image_path),
-                output_dir=str(artifact_dir),
-            )
-            full_image_instances = self._sam_only_runner(
-                inference_config,
-                generator=self.sam_generator,
             )
         else:
             detection_config = replace(

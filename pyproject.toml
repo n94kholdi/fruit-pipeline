@@ -13,7 +13,6 @@ dependencies = [
     "opencv-python",
     "PyYAML",
     "sahi",
-    "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
     # Pinned after SAM2.1 and full VOS compilation support; compatible with the
     # image's pinned PyTorch 2.5.1 / torchvision 0.20.1 pair.
     "SAM-2 @ git+https://github.com/facebookresearch/sam2.git@c2ec8e14a185632b0a5d8b161928ceb50197eddc",
@@ -44,7 +43,6 @@ fruit_pipeline = ["config/prompts/*.yaml"]
 
 [project.scripts]
 fruit-pipeline = "fruit_pipeline.cli:main"
-fruit-sam-only = "fruit_pipeline.sam_only_cli:main"
 fruit-size-pipeline = "fruit_pipeline.integrated_cli:main"
 fruit-inference = "fruit_pipeline.inference:main"
 fruit-eval = "fruit_pipeline.eval.cli:main"

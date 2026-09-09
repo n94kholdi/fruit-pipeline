@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fruit_pipeline.segmentation.sam_manager import env_flag
+from fruit_pipeline.utils.env import env_flag
 
 
 @dataclass(frozen=True)

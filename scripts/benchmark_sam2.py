@@ -94,7 +94,6 @@ def main() -> int:
         ("sam2_adaptive_refresh", base),
     ]
     report = {
-        "note": "Run scripts/benchmark_sam.py separately for the existing SAM ViT-L every-frame baseline.",
         "video": args.video,
         "variant": base.model_name,
         "results": [run_scenario(config, args.video, args.frame_step,

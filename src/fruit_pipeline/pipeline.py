@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import cv2
@@ -16,8 +16,9 @@ from fruit_pipeline.config.prompts import DEFAULT_PROMPT_CONFIG_PATH, load_promp
 from fruit_pipeline.detection.backends import DetectorBackend, load_detector_backend
 from fruit_pipeline.detection.merging import filter_oversized_boxes, merge_detections, to_detections
 from fruit_pipeline.detection.tiling import TileStats, detect_tiled
-from fruit_pipeline.segmentation.sam import FruitInstance, filter_masks, load_sam_manager, segment_boxes
-from fruit_pipeline.segmentation.sam_manager import env_flag
+from fruit_pipeline.segmentation.sam import FruitInstance, filter_masks, segment_boxes
+from fruit_pipeline.segmentation.sam2_config import SAM2Config
+from fruit_pipeline.segmentation.sam2_manager import get_sam2_model_manager
 from fruit_pipeline.visualization.rendering import draw_overlays, draw_tile_grid
 
 logger = logging.getLogger(__name__)
@@ -62,13 +63,9 @@ class PipelineConfig:
     nms_metric: str = "iou"  # "iou" or "diou", used by seam-aware/nms strategies' suppression core
     containment_threshold: float = 0.9  # intersection / smaller-box-area above which the lower-scoring box is dropped
 
-    # Segmentation
-    sam_checkpoint: str = "models/sam_vit_l_0b3195.pth"
-    sam_model_type: str = "vit_l"
+    # Segmentation (SAM2, box-prompted image segmentation)
+    sam2_config: SAM2Config = field(default_factory=SAM2Config.from_env)
     sam_batch_size: int = 16
-    sam_use_fp16: bool = field(
-        default_factory=lambda: env_flag("FRUIT_PIPELINE_SAM_USE_FP16", True)
-    )
 
     # Mask sanity filters
     min_mask_area: int = 30
@@ -125,16 +122,19 @@ def _load_backend(config: PipelineConfig, device: str) -> DetectorBackend:
 
 
 def load_models(config: PipelineConfig):
-    """Load the detector + SAM predictor once, for reuse across many images."""
+    """Load the detector + SAM2 predictor once, for reuse across many images."""
     device = resolve_device(config.device)
     detector = _load_backend(config, device)
-    sam_predictor = load_sam_manager(
-        checkpoint=config.sam_checkpoint,
-        model_type=config.sam_model_type,
-        device=device,
-        use_fp16=config.sam_use_fp16,
-    )
-    return detector, sam_predictor
+    sam2 = get_sam2_model_manager(_resolve_sam2_config(config))
+    return detector, sam2
+
+
+def _resolve_sam2_config(config: PipelineConfig) -> SAM2Config:
+    """Align the SAM2 config's device with the pipeline's resolved device."""
+    device = resolve_device(config.device)
+    if str(config.sam2_config.device) == device:
+        return config.sam2_config
+    return replace(config.sam2_config, device=device)
 
 
 def run_pipeline(config: PipelineConfig, detector=None, sam_predictor=None) -> list[FruitInstance]:
@@ -262,12 +262,7 @@ def run_pipeline(config: PipelineConfig, detector=None, sam_predictor=None) -> l
         )
 
     if sam_predictor is None:
-        sam_predictor = load_sam_manager(
-            checkpoint=config.sam_checkpoint,
-            model_type=config.sam_model_type,
-            device=device,
-            use_fp16=config.sam_use_fp16,
-        )
+        sam_predictor = get_sam2_model_manager(_resolve_sam2_config(config))
     instances = segment_boxes(
         image_rgb=image_rgb,
         predictor=sam_predictor,
