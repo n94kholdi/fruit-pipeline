@@ -538,7 +538,14 @@ The API accepts calibration captures asynchronously, stores camera calibration
 JSON under `FRUIT_PIPELINE_DATA_DIR`, prepares the first image/video frame for
 four-corner pallet selection, and runs `fruit-size-pipeline` as a background
 job. `Dockerfile` packages the same API for CI/CD without embedding model
-weights. At deployment time, mount a host directory at `/models` containing:
+weights. It builds `FROM` a reusable base image
+(`ghcr.io/n94kholdi/fruit-pipeline-base`) that carries only `python:3.11-slim`
+plus the pinned `torch`/`torchvision` CUDA build, so ordinary application
+builds no longer reinstall ~2 GB of CUDA wheels. That base image is rebuilt
+manually and only when PyTorch, torchvision, CUDA, or the Python base image
+changes -- see [`docker/base/README.md`](docker/base/README.md).
+
+At deployment time, mount a host directory at `/models` containing:
 
 ```text
 yolo11x.pt
@@ -550,18 +557,14 @@ The container reads them from `/models/yolo11x.pt` and
 `models_ready: true` after both files are mounted. This keeps the container
 image small and means GitHub Actions does not upload or download model files.
 
-The image pins PyTorch and defaults to its CUDA 11.8 wheel for broad NVIDIA
-driver compatibility (Linux driver 450.80.02 or newer). The host still needs
-an NVIDIA GPU, a compatible NVIDIA driver, and NVIDIA Container Toolkit; the
-container uses the host driver and cannot replace it. Newer CUDA wheel families
-supported by the pinned PyTorch release can be selected at build time without
-editing the Dockerfile:
-
-```bash
-docker build \
-  --build-arg PYTORCH_CUDA_FLAVOR=cu121 \
-  -t fruit-pipeline:cu121 .
-```
+The base image pins PyTorch and defaults to its CUDA 11.8 wheel for broad
+NVIDIA driver compatibility (Linux driver 450.80.02 or newer). The host still
+needs an NVIDIA GPU, a compatible NVIDIA driver, and NVIDIA Container Toolkit;
+the container uses the host driver and cannot replace it. Newer CUDA wheel
+families supported by the pinned PyTorch release are published as separate base
+image tags (e.g. `py3.11-torch2.5.1-cu121`); build one and point the
+application `Dockerfile`'s `FROM` at it -- see
+[`docker/base/README.md`](docker/base/README.md).
 
 Keep `FRUIT_PIPELINE_DEVICE=cuda` to require GPU inference. If the host driver,
 container runtime, and selected wheel are incompatible, the job fails instead

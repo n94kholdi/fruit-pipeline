@@ -80,6 +80,13 @@ jobs:
         with:
           context: .
           push: true
+          # The Dockerfile's FROM points at
+          # ghcr.io/<owner>/fruit-pipeline-base:<tag>, which the login step
+          # above authenticated for. pull: true always fetches the current
+          # base image from GHCR so a manual base rebuild is picked up. The
+          # base image itself is built out-of-band by build-base-image.yml
+          # (manual dispatch only) -- it is never rebuilt on push here.
+          pull: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=fruit-pipeline

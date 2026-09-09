@@ -1,4 +1,8 @@
-FROM python:3.11-slim
+# torch and torchvision are provided by this base image (python:3.11-slim +
+# the pinned PyTorch/torchvision CUDA build). It is defined in
+# docker/base/Dockerfile and rebuilt manually only when the PyTorch,
+# torchvision, CUDA, or Python base image changes -- see docker/base/README.md.
+FROM ghcr.io/n94kholdi/fruit-pipeline-base:py3.11-torch2.5.1-cu118
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -20,23 +24,8 @@ RUN apt-get update \
     && apt-get install --no-install-recommends --yes ffmpeg git libglib2.0-0 libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-ARG PYTORCH_VERSION=2.5.1
-ARG TORCHVISION_VERSION=0.20.1
-ARG PYTORCH_CUDA_FLAVOR=cu118
-
-# CUDA 11.8 runs on NVIDIA Linux drivers >= 450.80.02 and remains compatible
-# with newer drivers. Override PYTORCH_CUDA_FLAVOR (cu121 or cu124 for these
-# pinned PyTorch versions) when deploying to hardware that requires it. Keep
-# this independent of project metadata so dependency edits do not invalidate
-# the image's largest and most expensive layer.
-RUN python -m pip install --no-cache-dir \
-        "torch==${PYTORCH_VERSION}" \
-        "torchvision==${TORCHVISION_VERSION}" \
-        --index-url "https://download.pytorch.org/whl/${PYTORCH_CUDA_FLAVOR}" \
-    && python -c "import torch; expected='${PYTORCH_CUDA_FLAVOR}'; actual='cu' + str(torch.version.cuda).replace('.', ''); assert torch.__version__.startswith('${PYTORCH_VERSION}+'), f'Unexpected PyTorch version: {torch.__version__}'; assert actual == expected, f'Expected {expected}, installed {actual}'"
-
 # Install SAM 2 from Git in its own layer. --no-build-isolation makes pip build
-# it against the PyTorch installed above instead of provisioning a throwaway
+# it against the PyTorch from the base image instead of provisioning a throwaway
 # build env and pulling a second, PyPI/CUDA-12 copy of torch (plus its nvidia-*
 # wheels) into this layer -- the ~3 GB duplicate that bloated the image. The
 # slim base has no nvcc, so SAM2_BUILD_CUDA=0 skips the CUDA extension cleanly
