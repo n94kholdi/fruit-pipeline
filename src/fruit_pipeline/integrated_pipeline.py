@@ -29,6 +29,8 @@ from fruit_pipeline.sam_only_pipeline import SamOnlyConfig
 from fruit_pipeline.sam_only_pipeline import load_models as load_sam_only_models
 from fruit_pipeline.sam_only_pipeline import run_sam_only_pipeline
 from fruit_pipeline.segmentation.sam import FruitInstance
+from fruit_pipeline.segmentation.sam2_config import SAM2Config
+from fruit_pipeline.segmentation.sam2_manager import SAM2ModelManager, get_sam2_model_manager
 from fruit_pipeline.size_estimation.manual_selection import load_points, select_points
 from fruit_pipeline.size_estimation.pipeline import (
     SizeEstimationConfig,
@@ -69,6 +71,7 @@ class IntegratedPipelineConfig:
     pallet_selection_path: str | Path
     detection: PipelineConfig | None = None
     sam_only: SamOnlyConfig | None = None
+    sam2_video: SAM2Config | None = None
     pallet_points_file: str | Path | None = None
     frame_step: int = 10
     max_frames: int | None = None
@@ -80,18 +83,23 @@ class IntegratedPipelineConfig:
     min_pallet_overlap: float = 0.5
 
     def __post_init__(self) -> None:
-        if (self.detection is None) == (self.sam_only is None):
+        if sum(item is not None for item in (self.detection, self.sam_only, self.sam2_video)) != 1:
             raise ValueError(
-                "IntegratedPipelineConfig requires exactly one of 'detection' or 'sam_only'"
+                "IntegratedPipelineConfig requires exactly one of 'detection', 'sam_only', or 'sam2_video'"
             )
 
     @property
     def inference_mode(self) -> str:
+        if self.sam2_video is not None:
+            return "sam2_video"
         return "sam_only" if self.sam_only is not None else "detector"
 
     @property
     def output_dir(self) -> str:
         active = self.sam_only if self.sam_only is not None else self.detection
+        if active is None:
+            # SAM2 service configuration intentionally does not contain per-job paths.
+            return str(Path(self.pallet_selection_path).parent)
         return active.output_dir
 
 
@@ -178,10 +186,17 @@ def _fruit_record(
 ) -> dict[str, object]:
     return {
         "fruit_id": instance.instance_id,
+        "instance_id": instance.instance_id,
         "box": [round(float(value), 2) for value in instance.box],
+        "bbox": [round(float(value), 2) for value in instance.box],
         "category_name": instance.category_name,
         "detector_score": round(float(instance.detector_score), 4),
         "sam_score": round(float(instance.sam_score), 4),
+        "confidence": round(float(instance.confidence), 4) if instance.confidence is not None else None,
+        "first_seen_frame": instance.first_seen_frame,
+        "last_seen_frame": instance.last_seen_frame,
+        "last_discovery_frame": instance.last_discovery_frame,
+        "tracking_state": instance.tracking_state,
         "size": measurement.to_dict() if measurement is not None else None,
     }
 
@@ -221,6 +236,7 @@ class IntegratedFruitSizingPipeline:
         detector=None,
         sam_predictor=None,
         sam_generator=None,
+        sam2_manager: SAM2ModelManager | None = None,
         model_loader: Callable[[PipelineConfig], tuple[object, object]] = load_models,
         detection_runner: Callable[..., list[FruitInstance]] = run_pipeline,
         sam_only_model_loader: Callable[[SamOnlyConfig], object] = load_sam_only_models,
@@ -245,6 +261,7 @@ class IntegratedFruitSizingPipeline:
         self.detector = detector
         self.sam_predictor = sam_predictor
         self.sam_generator = sam_generator
+        self.sam2_manager = sam2_manager
         self._model_loader = model_loader
         self._detection_runner = detection_runner
         self._sam_only_model_loader = sam_only_model_loader
@@ -252,6 +269,9 @@ class IntegratedFruitSizingPipeline:
         self._frame_processed = frame_processed
         self._sizing_pipeline: SizeEstimationPipeline | None = None
         self._calibration_resolution: tuple[int, int] | None = None
+        # sam2_video only: reuse a fruit's last measurement across propagated
+        # frames instead of remeasuring a mask that has not moved.
+        self._sam2_measurement_cache: dict[int, tuple[FruitMeasurement, int]] = {}
 
     def prepare_pallet(self, image_bgr: np.ndarray) -> PalletDetector:
         """Load or collect pallet corners, validate them, and save a preview.
@@ -327,6 +347,8 @@ class IntegratedFruitSizingPipeline:
         return self.run_video(source_text)
 
     def run_image(self, image_path: str | Path) -> MediaResult:
+        if self.config.inference_mode == "sam2_video":
+            raise ValueError("sam2_video requires a video or live stream; use sam_only for a still image")
         path = Path(image_path)
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None:
@@ -368,6 +390,25 @@ class IntegratedFruitSizingPipeline:
                 raise ValueError(f"Video or stream contains no readable frames: {source}")
             self.prepare_pallet(self._normalize_frame(first_frame))
             self._ensure_models(source)
+            if self.config.inference_mode == "sam2_video":
+                self._sam2_measurement_cache.clear()
+                normalized_first = self._normalize_frame(first_frame)
+                corners = self.pallet_detector.detect(normalized_first).corners_px
+                frame_height, frame_width = normalized_first.shape[:2]
+                x, y, width, height = cv2.boundingRect(np.round(corners).astype(np.int32))
+                # Clamp to the frame: a pallet ROI detected flush against the
+                # edge can otherwise push the box one pixel out of bounds.
+                crop_box = (
+                    max(0, x), max(0, y),
+                    min(frame_width, x + width), min(frame_height, y + height),
+                )
+                self.sam2_manager.start_camera(
+                    self.config.sizing.camera_id,
+                    source,
+                    normalized_first.shape[:2],
+                    crop_box,
+                    cv2.cvtColor(normalized_first, cv2.COLOR_BGR2RGB),
+                )
 
             raw_frame_count_value = float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
             raw_frame_count = (
@@ -418,6 +459,8 @@ class IntegratedFruitSizingPipeline:
                 frame_index += 1
         finally:
             capture.release()
+            if self.config.inference_mode == "sam2_video" and self.sam2_manager is not None:
+                self.sam2_manager.stop_camera(self.config.sizing.camera_id)
 
         result = MediaResult(source, str(self.config.pallet_selection_path), frames)
         result.save(Path(self.config.output_dir) / f"{stem}_summary.json")
@@ -470,7 +513,10 @@ class IntegratedFruitSizingPipeline:
         return normalized
 
     def _ensure_models(self, image_path: str) -> None:
-        if self.config.inference_mode == "sam_only":
+        if self.config.inference_mode == "sam2_video":
+            if self.sam2_manager is None:
+                self.sam2_manager = get_sam2_model_manager(self.config.sam2_video)
+        elif self.config.inference_mode == "sam_only":
             if self.sam_generator is None:
                 model_config = replace(self.config.sam_only, image_path=image_path)
                 self.sam_generator = self._sam_only_model_loader(model_config)
@@ -487,7 +533,18 @@ class IntegratedFruitSizingPipeline:
         artifact_dir: Path,
     ) -> FrameResult:
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        if self.config.inference_mode == "sam_only":
+        if self.config.inference_mode == "sam2_video":
+            image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+            full_image_instances, timing = self.sam2_manager.process_frame(
+                self.config.sizing.camera_id,
+                image_rgb,
+                frame_index if frame_index is not None else 0,
+            )
+            logger.info(
+                "SAM2 frame %s: discovery=%.1fms propagation=%.1fms",
+                frame_index, timing.discovery_ms, timing.propagation_ms,
+            )
+        elif self.config.inference_mode == "sam_only":
             inference_config = replace(
                 self.config.sam_only,
                 image_path=str(image_path),
@@ -524,7 +581,10 @@ class IntegratedFruitSizingPipeline:
         )
         if self._sizing_pipeline is None:
             raise RuntimeError("Pallet setup must complete before frame processing")
-        sizing_result = self._sizing_pipeline.run(image_bgr, instances)
+        if self.config.inference_mode == "sam2_video":
+            sizing_result = self._run_sam2_sizing(image_bgr, instances)
+        else:
+            sizing_result = self._sizing_pipeline.run(image_bgr, instances)
         sizing_result.save(artifact_dir, image_path.stem)
         frame_result = FrameResult(
             source_image=str(image_path),
@@ -544,6 +604,51 @@ class IntegratedFruitSizingPipeline:
             len(sizing_result.measurements),
         )
         return frame_result
+
+    _SAM2_MASK_AREA_CHANGE_THRESHOLD = 0.08
+
+    def _run_sam2_sizing(
+        self, image_bgr: np.ndarray, instances: list[FruitInstance]
+    ) -> SizeEstimationResult:
+        """Measure only fruit whose mask is new or has changed meaningfully.
+
+        A fruit re-discovered this frame, seen for the first time, or whose
+        mask area moved beyond the threshold gets a fresh measurement; a
+        merely propagated, stable mask reuses its last one. This keeps sizing
+        cost tied to how much actually changed rather than to frame rate.
+        """
+        active_ids = {instance.instance_id for instance in instances}
+        for stale_id in list(self._sam2_measurement_cache):
+            if stale_id not in active_ids:
+                del self._sam2_measurement_cache[stale_id]
+
+        to_measure: list[FruitInstance] = []
+        for instance in instances:
+            cached = self._sam2_measurement_cache.get(instance.instance_id)
+            area = int(np.count_nonzero(instance.mask))
+            stale = (
+                cached is None
+                or instance.tracking_state == "discovered"
+                or cached[1] == 0
+                or abs(area - cached[1]) / cached[1] > self._SAM2_MASK_AREA_CHANGE_THRESHOLD
+            )
+            if stale:
+                to_measure.append(instance)
+
+        sizing_result = self._sizing_pipeline.run(image_bgr, to_measure)
+        fresh_by_id = {item.fruit_id: item for item in sizing_result.measurements}
+        for instance in to_measure:
+            measurement = fresh_by_id.get(instance.instance_id)
+            if measurement is not None:
+                self._sam2_measurement_cache[instance.instance_id] = (
+                    measurement, int(np.count_nonzero(instance.mask)),
+                )
+        sizing_result.measurements = [
+            self._sam2_measurement_cache[instance.instance_id][0]
+            for instance in instances
+            if instance.instance_id in self._sam2_measurement_cache
+        ]
+        return sizing_result
 
 
 def _finite_float_or_none(value: float) -> float | None:

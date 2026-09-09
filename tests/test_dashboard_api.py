@@ -1,12 +1,18 @@
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import pytest
+from fastapi import HTTPException
 
 from fruit_pipeline import dashboard_api
+from fruit_pipeline.camera_calibration.calibration_store import CalibrationStore
+from fruit_pipeline.camera_calibration.models import CameraCalibration
 from fruit_pipeline.live import FruitLiveReporter
+from fruit_pipeline.segmentation.sam2_config import SAM2Config
 
 
 def _fruit_job_request(**changes):
@@ -309,3 +315,85 @@ def test_cancel_running_fruit_job_terminates_process(tmp_path, monkeypatch):
     assert response["data"]["status"] == "cancelling"
     assert process.terminate_called is True
     assert (tmp_path / "job-cancel-running" / "cancel.requested").is_file()
+
+
+def test_startup_preloads_the_persistent_sam2_manager(monkeypatch):
+    config = SAM2Config(device="cpu")
+    calls = []
+    monkeypatch.setattr(dashboard_api, "SERVICE_INFERENCE_MODE", "sam2_video")
+    monkeypatch.setattr(dashboard_api, "SAM2_CONFIG", config)
+    monkeypatch.setattr(
+        dashboard_api, "get_sam2_model_manager",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    dashboard_api.preload_sam_model()
+
+    assert calls == [((config,), {"eager": True})]
+
+
+def test_health_reports_sam2_status_when_selected(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "sam2.pt"
+    checkpoint.touch()
+    config = SAM2Config(device="cpu", checkpoint=str(checkpoint))
+    fake_manager = SimpleNamespace(status=lambda: {"model_name": config.model_name, "loaded": True})
+    monkeypatch.setattr(dashboard_api, "SERVICE_INFERENCE_MODE", "sam2_video")
+    monkeypatch.setattr(dashboard_api, "SAM2_CONFIG", config)
+    monkeypatch.setattr(dashboard_api, "get_sam2_model_manager", lambda *a, **k: fake_manager)
+
+    payload = dashboard_api.health()
+
+    assert payload["inference_mode"] == "sam2_video"
+    assert payload["models_ready"] is True
+    assert payload["models"]["sam2_selected"] is True
+    assert payload["sam2"] == {"model_name": config.model_name, "loaded": True}
+
+
+def _save_calibration(calibration_dir: Path, camera_id: str) -> None:
+    CalibrationStore(calibration_dir).save(
+        CameraCalibration(
+            camera_id=camera_id,
+            camera_group=None,
+            resolution=(160, 240),
+            camera_matrix=np.array([[500.0, 0, 80.0], [0, 500.0, 120.0], [0, 0, 1.0]]),
+            distortion_coefficients=np.zeros(5),
+            reprojection_error=0.1,
+        )
+    )
+
+
+def test_create_fruit_job_rejects_a_mode_the_worker_was_not_started_with(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_api, "INPUT_DIR", tmp_path / "inputs")
+    monkeypatch.setattr(dashboard_api, "CALIBRATION_DIR", tmp_path / "calibrations")
+    monkeypatch.setattr(dashboard_api, "SERVICE_INFERENCE_MODE", "sam2_video")
+    input_folder = dashboard_api.INPUT_DIR / "input-01"
+    input_folder.mkdir(parents=True)
+    (input_folder / "source.jpg").touch()
+    _save_calibration(dashboard_api.CALIBRATION_DIR, "camera-01")
+
+    with pytest.raises(HTTPException) as excinfo:
+        dashboard_api.create_fruit_job(_fruit_job_request(inference_mode="detector"))
+
+    assert excinfo.value.status_code == 422
+    assert "sam2_video" in str(excinfo.value.detail)
+
+
+def test_sam2_idle_cleanup_loop_sweeps_immediately_and_stops_cleanly(monkeypatch):
+    calls = []
+    manager = SimpleNamespace(
+        config=SimpleNamespace(camera_idle_timeout_seconds=60.0),
+        cleanup_idle=lambda: calls.append(1) or ["stale-camera"],
+    )
+    dashboard_api._sam2_cleanup_stop.clear()
+    thread = threading.Thread(target=dashboard_api._sam2_idle_cleanup_loop, args=(manager,), daemon=True)
+    thread.start()
+    try:
+        for _ in range(200):
+            if calls:
+                break
+            threading.Event().wait(0.01)
+        assert calls, "cleanup_idle should run once immediately, not only after the first interval"
+    finally:
+        dashboard_api._sam2_cleanup_stop.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()

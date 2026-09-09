@@ -15,18 +15,20 @@ from fruit_pipeline.integrated_pipeline import (
 )
 from fruit_pipeline.live import FruitLiveReporter
 from fruit_pipeline.sam_only_pipeline import SamOnlyConfig
+from fruit_pipeline.segmentation.sam2_config import SAM2Config
 from fruit_pipeline.size_estimation.pipeline import SizeEstimationConfig
 
-INFERENCE_MODES = ("sam_only", "detector")
+INFERENCE_MODES = ("sam_only", "detector", "sam2_video")
 
 
 def build_parser():
     parser = build_detection_parser()
     parser.description = (
         "Select/load pallet corners, then detect, segment, count, and size fruit in an image or video. "
-        "Two inference modes: 'sam_only' (default, see --inference-mode) needs no detector at all -- "
+        "Three inference modes: 'sam_only' (default, see --inference-mode) needs no detector at all -- "
         "SAM's own automatic mask generator proposes and segments every fruit; 'detector' is the original "
-        "detector + box-prompted-SAM pipeline (see the 'detection'/'merge' groups below)."
+        "detector + box-prompted-SAM pipeline; 'sam2_video' discovers automatically and propagates masks "
+        "between refresh frames. The SAM2 variant is fixed by the container environment."
     )
     for action in parser._actions:
         if action.dest == "image":
@@ -41,7 +43,8 @@ def build_parser():
         help="'sam_only' (default): no detector -- SAM's automatic mask generator proposes and segments "
         "every fruit instance itself (tune it via the 'SAM automatic mask generator' group below; the "
         "'detection'/'merge' groups are ignored in this mode). 'detector': the original detector + "
-        "box-prompted-SAM pipeline (the 'SAM automatic mask generator' group is ignored in this mode).",
+        "box-prompted-SAM pipeline. 'sam2_video': stateful SAM2 discovery and video propagation; configure "
+        "FRUIT_PIPELINE_SAM2_MODEL before starting the container.",
     )
 
     mask_gen = parser.add_argument_group(
@@ -217,6 +220,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     detection_config = None
     sam_only_config = None
+    sam2_video_config = None
     if args.inference_mode == "sam_only":
         sam_only_config = SamOnlyConfig(
             image_path=str(source),
@@ -244,8 +248,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             device=args.device,
             save_visualization=not args.no_visualization,
         )
-    else:
+    elif args.inference_mode == "detector":
         detection_config = _config_from_args(args, str(source), str(output_dir))
+    else:
+        sam2_video_config = SAM2Config.from_env()
     sizing_config = SizeEstimationConfig(
         camera_id=args.camera_id,
         camera_group=args.camera_group,
@@ -259,6 +265,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = IntegratedPipelineConfig(
         detection=detection_config,
         sam_only=sam_only_config,
+        sam2_video=sam2_video_config,
         sizing=sizing_config,
         pallet_type=args.pallet_type,
         pallet_selection_path=selection_path,

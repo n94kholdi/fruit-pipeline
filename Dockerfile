@@ -8,6 +8,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FRUIT_PIPELINE_DETECTOR_WEIGHTS=/models/yolo11x.pt \
     FRUIT_PIPELINE_SAM_CHECKPOINT=/models/sam_vit_l_0b3195.pth \
     FRUIT_PIPELINE_SAM_USE_FP16=true \
+    FRUIT_PIPELINE_INFERENCE_MODE=sam_only \
+    FRUIT_PIPELINE_SAM2_MODEL=sam2.1_hiera_base_plus \
+    SAM2_PRECISION=bf16 \
+    SAM2_RUNTIME=pytorch \
+    SAM2_VOS_OPTIMIZED=false \
     YOLO_CONFIG_DIR=/app/output/.config/Ultralytics
 
 WORKDIR /app

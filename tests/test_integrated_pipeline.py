@@ -19,7 +19,9 @@ from fruit_pipeline.integrated_pipeline import (
 from fruit_pipeline.pallet_geometry.detector import ManualPalletDetector
 from fruit_pipeline.pipeline import PipelineConfig
 from fruit_pipeline.segmentation.sam import FruitInstance
-from fruit_pipeline.size_estimation.pipeline import SizeEstimationConfig
+from fruit_pipeline.segmentation.sam2_config import SAM2Config
+from fruit_pipeline.segmentation.sam2_manager import SAM2Timing
+from fruit_pipeline.size_estimation.pipeline import SizeEstimationConfig, SizeEstimationPipeline
 
 
 def _config(tmp_path: Path, source: Path, *, frame_step: int = 10) -> IntegratedPipelineConfig:
@@ -56,6 +58,40 @@ def _config(tmp_path: Path, source: Path, *, frame_step: int = 10) -> Integrated
         pallet_points_file=points_file,
         frame_step=frame_step,
     )
+
+
+def _sam2_config(tmp_path: Path, source: Path, *, frame_step: int = 10) -> IntegratedPipelineConfig:
+    return replace(
+        _config(tmp_path, source, frame_step=frame_step),
+        detection=None,
+        sam2_video=SAM2Config(device="cpu"),
+    )
+
+
+class _FakeSAM2Manager:
+    """Stands in for ``SAM2ModelManager`` so tests never touch a real model."""
+
+    def __init__(self, instances_by_frame: dict[int, list[FruitInstance]]):
+        self.instances_by_frame = instances_by_frame
+        self.start_calls: list[tuple] = []
+        self.process_calls: list[tuple[str, int]] = []
+        self.stop_calls: list[str] = []
+
+    def start_camera(self, camera_id, source, frame_shape, crop_box=None, initial_frame_rgb=None):
+        self.start_calls.append((camera_id, source, frame_shape, crop_box))
+
+    def process_frame(self, camera_id, image_rgb, frame_index, **kwargs):
+        self.process_calls.append((camera_id, frame_index))
+        return self.instances_by_frame[frame_index], SAM2Timing()
+
+    def stop_camera(self, camera_id):
+        self.stop_calls.append(camera_id)
+
+
+def _fruit_mask(y1, y2, x1, x2, shape=(240, 160)):
+    mask = np.zeros(shape, dtype=bool)
+    mask[y1:y2, x1:x2] = True
+    return mask
 
 
 def _fake_detection_runner(config, detector, sam_predictor):
@@ -266,3 +302,153 @@ def test_pallet_is_reselected_on_each_run_by_default(tmp_path, monkeypatch):
         ManualPalletDetector.load(selection_path).detect(image).corners_px,
         selected,
     )
+
+
+def _make_fake_capture(frames: list[np.ndarray]):
+    class FakeCapture:
+        def __init__(self, _path):
+            self.index = 0
+            self.last_read = -1
+
+        def isOpened(self):
+            return True
+
+        def read(self):
+            if self.index >= len(frames):
+                return False, None
+            frame = frames[self.index]
+            self.last_read = self.index
+            self.index += 1
+            return True, frame
+
+        def get(self, property_id):
+            if property_id == cv2.CAP_PROP_FRAME_COUNT:
+                return len(frames)
+            return self.last_read * 40.0
+
+        def release(self):
+            pass
+
+    return FakeCapture
+
+
+def test_sam2_video_pipeline_discovers_then_propagates_and_records_lifecycle_fields(tmp_path, monkeypatch):
+    video_path = tmp_path / "fruit.mp4"
+    video_path.touch()
+    config = _sam2_config(tmp_path, video_path, frame_step=10)
+    frames = [np.zeros((240, 160, 3), np.uint8) for _ in range(25)]
+    monkeypatch.setattr(
+        "fruit_pipeline.integrated_pipeline.cv2.VideoCapture", _make_fake_capture(frames)
+    )
+    mask = _fruit_mask(40, 81, 30, 51)
+    manager = _FakeSAM2Manager({
+        0: [FruitInstance(1, [30, 40, 51, 81], 1.0, "fruit", 1.0, mask,
+                           confidence=0.9, first_seen_frame=0, last_seen_frame=0,
+                           last_discovery_frame=0, tracking_state="discovered")],
+        10: [FruitInstance(1, [30, 40, 51, 81], 1.0, "fruit", 1.0, mask,
+                            confidence=0.85, first_seen_frame=0, last_seen_frame=10,
+                            last_discovery_frame=0, tracking_state="tracked")],
+        20: [FruitInstance(1, [30, 40, 51, 81], 1.0, "fruit", 1.0, mask,
+                            confidence=0.85, first_seen_frame=0, last_seen_frame=20,
+                            last_discovery_frame=0, tracking_state="tracked")],
+    })
+
+    result = IntegratedFruitSizingPipeline(config, sam2_manager=manager).run(video_path)
+
+    assert [frame.frame_index for frame in result.frames] == [0, 10, 20]
+    assert manager.process_calls == [("cam_001", 0), ("cam_001", 10), ("cam_001", 20)]
+    assert len(manager.start_calls) == 1
+    camera_id, source, frame_shape, crop_box = manager.start_calls[0]
+    assert (camera_id, source, frame_shape) == ("cam_001", str(video_path), (240, 160))
+    # The pallet corners are (10,10)-(110,10)-(110,210)-(10,210); the crop is
+    # their bounding box, in full-frame pixel coordinates (cv2.boundingRect is
+    # inclusive of the corner pixel, hence the +1 on each far edge).
+    assert crop_box == (10, 10, 111, 211)
+    assert manager.stop_calls == ["cam_001"]
+
+    first_fruit = result.frames[0].to_dict()["fruits"][0]
+    assert first_fruit["tracking_state"] == "discovered"
+    assert first_fruit["confidence"] == 0.9
+    assert first_fruit["last_discovery_frame"] == 0
+    tracked_fruit = result.frames[1].to_dict()["fruits"][0]
+    assert tracked_fruit["tracking_state"] == "tracked"
+    assert tracked_fruit["last_seen_frame"] == 10
+
+
+def test_sam2_video_releases_camera_state_even_if_a_frame_raises(tmp_path, monkeypatch):
+    video_path = tmp_path / "fruit.mp4"
+    video_path.touch()
+    config = _sam2_config(tmp_path, video_path, frame_step=10)
+    frames = [np.zeros((240, 160, 3), np.uint8) for _ in range(25)]
+    monkeypatch.setattr(
+        "fruit_pipeline.integrated_pipeline.cv2.VideoCapture", _make_fake_capture(frames)
+    )
+
+    class _RaisingManager(_FakeSAM2Manager):
+        def process_frame(self, camera_id, image_rgb, frame_index, **kwargs):
+            if frame_index == 10:
+                raise RuntimeError("SAM2 tracking failure")
+            return super().process_frame(camera_id, image_rgb, frame_index, **kwargs)
+
+    mask = _fruit_mask(40, 81, 30, 51)
+    manager = _RaisingManager({0: [], 10: [], 20: []})
+    manager.instances_by_frame[0] = [
+        FruitInstance(1, [30, 40, 51, 81], 1.0, "fruit", 1.0, mask, tracking_state="discovered")
+    ]
+
+    with pytest.raises(RuntimeError, match="SAM2 tracking failure"):
+        IntegratedFruitSizingPipeline(config, sam2_manager=manager).run(video_path)
+
+    assert manager.stop_calls == ["cam_001"]
+
+
+def test_run_image_rejects_sam2_video_mode(tmp_path):
+    image_path = tmp_path / "fruit.jpg"
+    cv2.imwrite(str(image_path), np.zeros((240, 160, 3), np.uint8))
+    config = _sam2_config(tmp_path, image_path)
+
+    with pytest.raises(ValueError, match="sam2_video requires a video or live stream"):
+        IntegratedFruitSizingPipeline(config, sam2_manager=_FakeSAM2Manager({})).run(image_path)
+
+
+def test_sam2_propagated_frames_reuse_measurement_until_mask_changes(tmp_path, monkeypatch):
+    video_path = tmp_path / "fruit.mp4"
+    video_path.touch()
+    config = _sam2_config(tmp_path, video_path, frame_step=10)
+    frames = [np.zeros((240, 160, 3), np.uint8) for _ in range(25)]
+    monkeypatch.setattr(
+        "fruit_pipeline.integrated_pipeline.cv2.VideoCapture", _make_fake_capture(frames)
+    )
+    stable_mask = _fruit_mask(40, 81, 30, 51)  # 41 x 21 = 861px
+    grown_mask = _fruit_mask(40, 100, 30, 51)  # 60 x 21 = 1260px, +46%
+    manager = _FakeSAM2Manager({
+        0: [FruitInstance(1, [30, 40, 51, 81], 1.0, "fruit", 1.0, stable_mask,
+                           tracking_state="discovered")],
+        10: [FruitInstance(1, [30, 40, 51, 81], 1.0, "fruit", 1.0, stable_mask,
+                            tracking_state="tracked")],
+        20: [FruitInstance(1, [30, 40, 51, 100], 1.0, "fruit", 1.0, grown_mask,
+                            tracking_state="tracked")],
+    })
+    recorded_ids: list[list[int]] = []
+    original_run = SizeEstimationPipeline.run
+
+    def spy_run(self, image_bgr, fruits):
+        fruits = list(fruits)
+        recorded_ids.append([fruit.instance_id for fruit in fruits])
+        return original_run(self, image_bgr, fruits)
+
+    monkeypatch.setattr(SizeEstimationPipeline, "run", spy_run)
+
+    result = IntegratedFruitSizingPipeline(config, sam2_manager=manager).run(video_path)
+
+    # Frame 0 measures the newly discovered fruit; frame 10's mask is
+    # unchanged so it is skipped and the frame-0 measurement is reused;
+    # frame 20's mask grew well past the change threshold, so it is
+    # remeasured.
+    assert recorded_ids == [[1], [], [1]]
+    first_measurement = result.frames[0].sizing.measurements[0]
+    reused_measurement = result.frames[1].sizing.measurements[0]
+    remeasured = result.frames[2].sizing.measurements[0]
+    assert reused_measurement is first_measurement
+    assert remeasured is not first_measurement
+    assert remeasured.length_mm > first_measurement.length_mm

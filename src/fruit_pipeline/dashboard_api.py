@@ -32,6 +32,8 @@ from fruit_pipeline.live import FruitLiveReporter
 from fruit_pipeline.pallet_geometry.pallet_config import PalletTypeConfig
 from fruit_pipeline.pipeline import resolve_device
 from fruit_pipeline.segmentation.sam_manager import env_flag, get_sam_model_manager
+from fruit_pipeline.segmentation.sam2_config import SAM2Config
+from fruit_pipeline.segmentation.sam2_manager import get_sam2_model_manager
 
 
 DATA_DIR = Path(os.getenv("FRUIT_PIPELINE_DATA_DIR", "outputs/dashboard")).resolve()
@@ -44,6 +46,10 @@ SAM_CHECKPOINT = os.getenv("FRUIT_PIPELINE_SAM_CHECKPOINT", "models/sam_vit_l_0b
 DEVICE = os.getenv("FRUIT_PIPELINE_DEVICE", "cpu")
 SAM_MODEL_TYPE = os.getenv("FRUIT_PIPELINE_SAM_MODEL_TYPE", "vit_l")
 SAM_USE_FP16 = env_flag("FRUIT_PIPELINE_SAM_USE_FP16", True)
+SERVICE_INFERENCE_MODE = os.getenv("FRUIT_PIPELINE_INFERENCE_MODE", "sam_only")
+if SERVICE_INFERENCE_MODE not in {"sam_only", "detector", "sam2_video"}:
+    raise ValueError("FRUIT_PIPELINE_INFERENCE_MODE must be sam_only, detector, or sam2_video")
+SAM2_CONFIG = SAM2Config.from_env()
 MAX_UPLOAD_BYTES = int(os.getenv("FRUIT_PIPELINE_MAX_UPLOAD_BYTES", str(1024**3)))
 WORKERS = max(1, int(os.getenv("FRUIT_PIPELINE_JOB_WORKERS", "1")))
 MAX_CAPTURED_CALIBRATION_FRAMES = 300
@@ -54,6 +60,10 @@ for directory in (CALIBRATION_DIR, INPUT_DIR, JOB_DIR):
 
 def preload_sam_model() -> None:
     """Populate the process-wide GPU cache before the first inference request."""
+    if SERVICE_INFERENCE_MODE == "sam2_video":
+        # Readiness failures are fatal by design when the SAM2 service is selected.
+        get_sam2_model_manager(SAM2_CONFIG, eager=True)
+        return
     if not Path(SAM_CHECKPOINT).is_file():
         logger.warning("SAM startup preload skipped; checkpoint is missing: %s", SAM_CHECKPOINT)
         return
@@ -65,10 +75,44 @@ def preload_sam_model() -> None:
     )
 
 
+_sam2_cleanup_stop = threading.Event()
+
+
+def _sam2_idle_cleanup_loop(manager) -> None:
+    """Periodically release camera state SAM2 left idle past its timeout.
+
+    Nothing else calls ``SAM2ModelManager.cleanup_idle`` -- without this loop,
+    a job that never reaches its own ``stop_camera`` (a crashed worker, a
+    stream that silently stalls) would hold GPU/CPU state forever.
+    """
+    interval = max(5.0, manager.config.camera_idle_timeout_seconds / 2)
+    while True:
+        try:
+            released = manager.cleanup_idle()
+            if released:
+                logger.info("SAM2 released idle camera state: %s", released)
+        except Exception:
+            logger.exception("SAM2 idle cleanup failed")
+        if _sam2_cleanup_stop.wait(interval):
+            return
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     preload_sam_model()
+    cleanup_thread: threading.Thread | None = None
+    if SERVICE_INFERENCE_MODE == "sam2_video":
+        manager = get_sam2_model_manager(SAM2_CONFIG, eager=False)
+        _sam2_cleanup_stop.clear()
+        cleanup_thread = threading.Thread(
+            target=_sam2_idle_cleanup_loop, args=(manager,),
+            daemon=True, name="sam2-idle-cleanup",
+        )
+        cleanup_thread.start()
     yield
+    _sam2_cleanup_stop.set()
+    if cleanup_thread is not None:
+        cleanup_thread.join(timeout=5)
 
 
 app = FastAPI(title="Tarebar Fruit Pipeline API", version="1.0.0", lifespan=_lifespan)
@@ -110,7 +154,7 @@ class FruitJobRequest(BaseModel):
     # "sam_only" (default): no detector -- SAM's own automatic mask generator
     # proposes and segments every fruit. "detector": the original detector +
     # box-prompted-SAM pipeline.
-    inference_mode: Literal["sam_only", "detector"] = "sam_only"
+    inference_mode: Literal["sam_only", "detector", "sam2_video"] = SERVICE_INFERENCE_MODE
 
 
 class StreamInputRequest(BaseModel):
@@ -430,13 +474,14 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
         "--max-calibration-error", str(request.max_calibration_error),
         "--frame-step", str(request.frame_step),
         "--min-pallet-overlap", str(request.min_pallet_overlap),
-        "--sam-checkpoint", SAM_CHECKPOINT,
         "--device", DEVICE,
         "--inference-mode", request.inference_mode,
         "--live-job-dir", str(job_dir),
         "--live-job-id", job_id,
         "-v",
     ]
+    if request.inference_mode != "sam2_video":
+        command += ["--sam-checkpoint", SAM_CHECKPOINT]
     if request.inference_mode == "detector":
         command += [
             "--detector-weights", DETECTOR_WEIGHTS,
@@ -491,14 +536,25 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
 def health() -> dict[str, object]:
     detector_exists = Path(DETECTOR_WEIGHTS).is_file()
     sam_exists = Path(SAM_CHECKPOINT).is_file()
-    return {
+    sam2_exists = Path(SAM2_CONFIG.resolved_checkpoint).is_file()
+    selected_ready = {
+        "sam_only": sam_exists,
+        "detector": detector_exists and sam_exists,
+        "sam2_video": sam2_exists,
+    }[SERVICE_INFERENCE_MODE]
+    payload = {
         "status": "ok",
-        "models_ready": detector_exists and sam_exists,
+        "inference_mode": SERVICE_INFERENCE_MODE,
+        "models_ready": selected_ready,
         "models": {
             "detector": detector_exists,
             "sam": sam_exists,
+            "sam2_selected": sam2_exists,
         },
     }
+    if SERVICE_INFERENCE_MODE == "sam2_video":
+        payload["sam2"] = get_sam2_model_manager(SAM2_CONFIG, eager=False).status()
+    return payload
 
 
 @app.get("/api/v1/pallet-types")
@@ -707,8 +763,16 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
     except CalibrationError as exc:
         raise HTTPException(404, str(exc)) from exc
     _validate_requested_pallet(request)
+    if request.inference_mode != SERVICE_INFERENCE_MODE:
+        raise HTTPException(
+            422,
+            f"This worker is configured for '{SERVICE_INFERENCE_MODE}'. Change "
+            "FRUIT_PIPELINE_INFERENCE_MODE and restart Docker to use another backend; "
+            "runtime model switching is disabled to protect GPU VRAM.",
+        )
     required_models = (
-        (SAM_CHECKPOINT,) if request.inference_mode == "sam_only" else (DETECTOR_WEIGHTS, SAM_CHECKPOINT)
+        (SAM2_CONFIG.resolved_checkpoint,) if request.inference_mode == "sam2_video" else
+        ((SAM_CHECKPOINT,) if request.inference_mode == "sam_only" else (DETECTOR_WEIGHTS, SAM_CHECKPOINT))
     )
     missing_models = [path for path in required_models if not Path(path).is_file()]
     if missing_models:

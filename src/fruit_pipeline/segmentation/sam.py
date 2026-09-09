@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
@@ -34,6 +35,18 @@ class FruitInstance:
     category_name: str
     sam_score: float
     mask: np.ndarray  # bool array, shape (H, W)
+    # Video lifecycle fields are optional so existing SAM1/detector callers and
+    # their positional constructor contract remain unchanged.
+    confidence: float | None = None
+    first_seen_frame: int | None = None
+    last_seen_frame: int | None = None
+    last_discovery_frame: int | None = None
+    tracking_state: Literal["discovered", "tracked", "uncertain", "lost"] | None = None
+
+    @property
+    def bbox(self) -> list[float]:
+        """Backward-compatible SAM2 name for the existing ``box`` field."""
+        return self.box
 
 
 def load_sam(

@@ -59,7 +59,7 @@ pip install -e .
 For evaluation or development tools, use `pip install -e '.[eval]'` or
 `pip install -e '.[dev]'` respectively. The editable install exposes the
 `fruit-pipeline`, `fruit-inference`, and `fruit-eval` commands.
-SAM is installed from Meta's official GitHub repository, matching its
+SAM1 and the pinned SAM2 implementation are installed from Meta's official GitHub repositories, matching their
 upstream installation guidance rather than relying on an unrelated PyPI
 package with a similar name.
 
@@ -69,6 +69,7 @@ package with a similar name.
 |---|---|---|
 | A standard Ultralytics YOLO checkpoint (`yolo11x.pt`, `yolov8x.pt`, `models/yolo11m.pt`, `models/yolov8m.pt`, ...) | tiled object-like-region detector (class-agnostic) | project root / `models/` |
 | SAM ViT-L checkpoint (`sam_vit_l_0b3195.pth`) | box-prompted segmentation | `models/sam_vit_l_0b3195.pth` |
+| One selected SAM2.1 Hiera checkpoint | automatic discovery plus video propagation | mounted under `/models` |
 
 Defaults (`--detector-weights yolo11x.pt`, `--sam-checkpoint
 models/sam_vit_l_0b3195.pth`) point at checkpoints already present in this
@@ -87,11 +88,85 @@ detection recall isn't limited to COCO's `apple` / `banana` / `orange`
 classes. Use `--use-yolo-world` if you're fine with that one-time download
 and want true open-vocabulary prompting.
 
-SAM2 was not used here even though the repo has a `sam2.1_t.pt` checkpoint,
-because the `sam2` package (plus its Hydra config files) isn't installed in
-this environment, while `segment-anything` (SAM1) and a matching ViT-L
-checkpoint already are. Swapping `segmentation/sam.py`'s `load_sam` for a SAM2
-loader later is a contained change if that's ever worth it.
+### SAM2 video backend
+
+`sam2_video` performs detector-free automatic discovery on the first and
+refresh frames, then propagates all active masks with `SAM2VideoPredictor` on
+intermediate processed frames. Discovery and propagation share one resident
+model. Stable IDs are reconciled with mask IoU, box IoU, and normalized
+centroid distance. SAM1 `sam_only` and `detector` remain available and the
+default remains `sam_only`.
+
+The backend and model size are container-start settings. They are deliberately
+not per-dashboard-job settings because changing them would temporarily keep
+multiple checkpoints in VRAM. All official SAM2.1 sizes are supported:
+
+| `FRUIT_PIPELINE_SAM2_MODEL` | Hydra config | checkpoint |
+|---|---|---|
+| `sam2.1_hiera_tiny` | `sam2.1_hiera_t.yaml` | `sam2.1_hiera_tiny.pt` |
+| `sam2.1_hiera_small` | `sam2.1_hiera_s.yaml` | `sam2.1_hiera_small.pt` |
+| `sam2.1_hiera_base_plus` (default) | `sam2.1_hiera_b+.yaml` | `sam2.1_hiera_base_plus.pt` |
+| `sam2.1_hiera_large` | `sam2.1_hiera_l.yaml` | `sam2.1_hiera_large.pt` |
+
+For example, start only Small:
+
+```bash
+FRUIT_PIPELINE_INFERENCE_MODE=sam2_video \
+FRUIT_PIPELINE_SAM2_MODEL=sam2.1_hiera_small \
+docker compose --env-file .env.production -f docker-compose.production.yml up -d --force-recreate model-downloader fruit-pipeline
+```
+
+Change `sam2.1_hiera_small` to `tiny`, `base_plus`, or `large` using the exact
+names in the table, then recreate the two services. The downloader fetches and
+checksum-verifies only the selected backend's required checkpoint. The API
+rejects a job whose `inference_mode` differs from the worker's startup mode.
+
+Precision is selected with `SAM2_PRECISION=bf16|fp16|fp32`. BF16 is the initial
+default and fails clearly on unsupported GPUs; choose FP16 or the validated
+FP32 fallback there. `SAM2_VOS_OPTIMIZED=true` enables SAM2's compiled VOS
+predictor. The first compiled run can take substantially longer.
+
+Refresh defaults are ten seconds or 30 **processed** frames, whichever becomes
+due first. Thirty source frames at 30 FPS is one second; 30 processed frames at
+3 FPS is ten seconds. Relevant limits are `SAM2_MAX_CAMERAS_PER_GPU`,
+`SAM2_MAX_ACTIVE_OBJECTS_PER_CAMERA`, `SAM2_MAX_TOTAL_ACTIVE_OBJECTS`,
+`SAM2_MAX_CONCURRENT_DISCOVERIES`, `SAM2_MAX_REFRESH_QUEUE`,
+`SAM2_MAX_GPU_QUEUE`, `SAM2_MAX_FRAME_HISTORY`, and
+`SAM2_CAMERA_IDLE_TIMEOUT_SECONDS`. `/health` reports
+the selected model, actual precision/runtime, compilation state, load time,
+VRAM, active state, discovery settings, and refresh queue counters.
+
+`SAM2_RUNTIME=pytorch` is the required baseline. `hybrid` and `tensorrt` are
+experimental and require an offline-built, checksum/config/GPU-compatible
+engine manifest under `SAM2_TENSORRT_ENGINE_DIR`. An absent or incompatible
+engine is reported and uses PyTorch only when
+`SAM2_TENSORRT_ALLOW_FALLBACK=true`; health never labels that fallback as
+TensorRT. Engines are never built during an API request.
+
+For production RTSP fleets, provide one decoded frame stream to the pipeline.
+Use an NVIDIA-enabled FFmpeg/GStreamer build (`h264_cuvid`/`hevc_cuvid` or
+`nvh264dec`/`nvh265dec`) upstream when NVDEC is available; the slim reference
+image's generic FFmpeg is a compatibility decoder, not proof that NVDEC is
+active. Do not open the camera separately for discovery: both SAM2 workloads
+consume the same sampled frame. Preview encoding and JSON/artifact writes stay
+outside model inference, and summaries store instance aggregates rather than a
+mask image for every observation.
+
+Run measured capacity tests on the target GPU, one variant/precision per
+container process:
+
+```bash
+SAM2_PRECISION=bf16 FRUIT_PIPELINE_SAM2_MODEL=sam2.1_hiera_base_plus \
+python scripts/benchmark_sam2.py production-video.mp4 --frame-step 10 --max-processed-frames 100
+python scripts/benchmark_sam.py production-frame.jpg --checkpoint /models/sam_vit_l_0b3195.pth
+```
+
+Repeat for Tiny, Small, Base+, and Large and for 1/2/4/8 concurrent streams.
+The SAM2 report separates discovery, propagation, end-to-end latency, FPS,
+count, runtime, and VRAM. Add labeled ground truth when comparing discovery
+recall, mask/boundary IoU, sizing error, and ID switches. Do not infer camera
+capacity from model-only FPS; stop increasing concurrency when the production
+latency/FPS objective fails.
 
 ## Run
 
@@ -519,7 +594,7 @@ docker compose exec fruit-pipeline python -c \
   "import torch; print(torch.__version__, torch.version.cuda); assert torch.cuda.is_available(); print(torch.cuda.get_device_name())"
 ```
 
-## Next stages (not implemented here)
+## Next stages
 
 Fruit-type classification and rotten/fine quality detection can be added as
 separate modules that join on each result's `instance_id`.
