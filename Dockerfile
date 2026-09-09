@@ -11,6 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SAM2_PRECISION=bf16 \
     SAM2_RUNTIME=pytorch \
     SAM2_VOS_OPTIMIZED=false \
+    SAM2_BUILD_CUDA=0 \
     YOLO_CONFIG_DIR=/app/output/.config/Ultralytics
 
 WORKDIR /app
@@ -34,15 +35,27 @@ RUN python -m pip install --no-cache-dir \
         --index-url "https://download.pytorch.org/whl/${PYTORCH_CUDA_FLAVOR}" \
     && python -c "import torch; expected='${PYTORCH_CUDA_FLAVOR}'; actual='cu' + str(torch.version.cuda).replace('.', ''); assert torch.__version__.startswith('${PYTORCH_VERSION}+'), f'Unexpected PyTorch version: {torch.__version__}'; assert actual == expected, f'Expected {expected}, installed {actual}'"
 
-# Install application dependencies in a separate layer. The temporary package
-# is enough for pip to read dependency metadata and create console entry points.
-# PYTHONPATH points those entry points at the real source copied below, so normal
-# source edits do not invalidate either dependency layer.
+# Install SAM 2 from Git in its own layer. --no-build-isolation makes pip build
+# it against the PyTorch installed above instead of provisioning a throwaway
+# build env and pulling a second, PyPI/CUDA-12 copy of torch (plus its nvidia-*
+# wheels) into this layer -- the ~3 GB duplicate that bloated the image. The
+# slim base has no nvcc, so SAM2_BUILD_CUDA=0 skips the CUDA extension cleanly
+# (runtime uses SAM2_VOS_OPTIMIZED=false and does not need it).
+ARG SAM2_REF=c2ec8e14a185632b0a5d8b161928ceb50197eddc
+RUN python -m pip install --no-cache-dir --no-build-isolation \
+        "SAM-2 @ git+https://github.com/facebookresearch/sam2.git@${SAM2_REF}"
+
+# Install the remaining application dependencies in a separate layer. The
+# temporary package is enough for pip to read dependency metadata and create the
+# console entry points. PYTHONPATH points those entry points at the real source
+# copied below, so normal source edits do not invalidate either dependency layer.
+# SAM 2 is already satisfied by the pinned commit above; --no-build-isolation
+# keeps pip from re-provisioning a torch-carrying build env if it re-checks it.
 COPY pyproject.toml README.md ./
 RUN mkdir -p src/fruit_pipeline \
     && touch src/fruit_pipeline/__init__.py \
-    && python -m pip install --no-cache-dir ".[api]" \
-    && rm -rf src build fruit_pipeline.egg-info
+    && python -m pip install --no-cache-dir --no-build-isolation ".[api]" \
+    && rm -rf src build fruit_pipeline.egg-info SAM-2.egg-info
 
 RUN useradd --create-home --uid 10001 appuser \
     && mkdir -p /app/output/dashboard /app/output/.config/Ultralytics \
