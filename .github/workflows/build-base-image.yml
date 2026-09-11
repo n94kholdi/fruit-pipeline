@@ -1,0 +1,50 @@
+name: Build fruit-pipeline base image
+
+# The base image (python:3.11-slim + pinned PyTorch/torchvision CUDA build) is
+# expensive and almost never changes. It is built here ONLY on manual dispatch,
+# never on push, so ordinary application commits reuse the published image.
+#
+# Rebuild it only when PyTorch, torchvision, CUDA, or the Python base image
+# changes -- see docker/base/README.md -- then update the FROM tag in Dockerfile.
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_flavor:
+        description: "PyTorch CUDA wheel flavor (cu118, cu121, cu124)"
+        required: true
+        default: "cu118"
+      tag:
+        description: "Image tag to publish"
+        required: true
+        default: "py3.11-torch2.5.1-cu118"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/fruit-pipeline-base
+
+jobs:
+  build-and-push-base:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+      - uses: docker/build-push-action@v6
+        with:
+          context: docker/base
+          file: docker/base/Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}
+          build-args: |
+            PYTORCH_CUDA_FLAVOR=${{ inputs.cuda_flavor }}
