@@ -175,15 +175,26 @@ class SAM2Config:
     match_box_iou: float = 0.20
     match_centroid_distance: float = 2.0
 
-    points_per_side: int = 64
+    # Balanced defaults: points_per_side=64 + crop_n_layers=1 (~4x the points
+    # AND ~5x the crops of these values) was measured to push automatic mask
+    # generation from seconds to well over a minute per image with little
+    # crowded-fruit recall benefit to show for it. Bump points_per_side (and,
+    # if recall on very crowded/small fruit still isn't enough, crop_n_layers)
+    # only after benchmarking the tradeoff -- see scripts/benchmark_sam2.py
+    # --sweep-discovery.
+    points_per_side: int = 32
     points_per_batch: int = 64
     pred_iou_thresh: float = 0.80
     stability_score_thresh: float = 0.90
     box_nms_thresh: float = 0.7
     min_mask_region_area: int = 30
-    crop_n_layers: int = 1
+    crop_n_layers: int = 0
     require_cuda_extension: bool = False
     debug_memory: bool = False
+    # Per-stage latency logging (preprocessing/mask generation/filtering/
+    # predictor init/registration/propagation/state reset). Independent of
+    # debug_memory, which covers CUDA allocated/reserved/max-allocated only.
+    debug_timing: bool = False
 
     def __post_init__(self) -> None:
         if self.model_name not in SAM2_VARIANTS:
@@ -262,13 +273,14 @@ class SAM2Config:
             offload_video_to_cpu=env_flag("SAM2_OFFLOAD_VIDEO_TO_CPU", True),
             offload_state_to_cpu=env_flag("SAM2_OFFLOAD_STATE_TO_CPU", True),
             missing_grace_refreshes=_env_int("SAM2_MISSING_GRACE_REFRESHS", 2),
-            points_per_side=_env_int("SAM2_POINTS_PER_SIDE", 64, 1),
+            points_per_side=_env_int("SAM2_POINTS_PER_SIDE", 32, 1),
             points_per_batch=_env_int("SAM2_POINTS_PER_BATCH", 64, 1),
             pred_iou_thresh=_env_float("SAM2_PRED_IOU_THRESH", 0.80),
             stability_score_thresh=_env_float("SAM2_STABILITY_SCORE_THRESH", 0.90),
             box_nms_thresh=_env_float("SAM2_BOX_NMS_THRESH", 0.7),
             min_mask_region_area=_env_int("SAM2_MIN_MASK_REGION_AREA", 30),
-            crop_n_layers=_env_int("SAM2_CROP_N_LAYERS", 1),
+            crop_n_layers=_env_int("SAM2_CROP_N_LAYERS", 0),
             require_cuda_extension=env_flag("SAM2_REQUIRE_CUDA_EXTENSION", False),
             debug_memory=env_flag("SAM2_DEBUG_MEMORY", False),
+            debug_timing=env_flag("SAM2_DEBUG_TIMING", False),
         )

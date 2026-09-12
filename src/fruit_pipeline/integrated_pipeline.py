@@ -350,25 +350,17 @@ class IntegratedFruitSizingPipeline:
                 raise OSError(f"Cannot write normalized input: {processing_path}")
         self.prepare_pallet(image)
         self._ensure_models(str(processing_path))
-        is_sam2 = self.config.inference_mode == "sam2_video"
-        if is_sam2:
-            # A still image is just a one-frame "video": start a camera
-            # session so process_frame() runs its one-shot automatic
-            # discovery pass (no prior instances means no propagation), then
-            # tear the session down immediately -- no video-length state is
-            # kept resident between separate image requests.
-            self._start_sam2_camera(str(processing_path), image)
-        try:
-            frame = self._process_frame(
-                image,
-                processing_path,
-                None,
-                None,
-                Path(self.config.output_dir),
-            )
-        finally:
-            if is_sam2:
-                self.sam2_manager.stop_camera(self.config.sizing.camera_id)
+        # A still image never starts a SAM2 video/camera session: it takes
+        # the lightweight image-only discovery path in _process_frame, which
+        # only runs automatic mask generation + filtering -- no video
+        # predictor state, no tracking-object registration, no frame history.
+        frame = self._process_frame(
+            image,
+            processing_path,
+            None,
+            None,
+            Path(self.config.output_dir),
+        )
         self._notify_frame(frame, image, 1, 1)
         result = MediaResult(str(path), str(self.config.pallet_selection_path), [frame])
         result.save(Path(self.config.output_dir) / f"{path.stem}_summary.json")
@@ -493,22 +485,30 @@ class IntegratedFruitSizingPipeline:
             )
         return normalized
 
-    def _start_sam2_camera(self, source: str, image_bgr: np.ndarray) -> None:
-        """Start a SAM2 camera session cropped to the pallet ROI for ``image_bgr``.
+    def _sam2_crop_box(self, image_bgr: np.ndarray) -> tuple[int, int, int, int]:
+        """The pallet ROI for ``image_bgr``, as a SAM2 discovery crop box.
 
-        Shared by ``run_image`` (a one-shot discovery pass, stopped right
-        after) and ``run_video`` (discovery plus propagation across frames).
+        Shared by ``_start_sam2_camera`` (video mode) and the image-only
+        discovery path in ``_process_frame``.
         """
-        self._sam2_measurement_cache.clear()
         corners = self.pallet_detector.detect(image_bgr).corners_px
         frame_height, frame_width = image_bgr.shape[:2]
         x, y, width, height = cv2.boundingRect(np.round(corners).astype(np.int32))
         # Clamp to the frame: a pallet ROI detected flush against the edge
         # can otherwise push the box one pixel out of bounds.
-        crop_box = (
+        return (
             max(0, x), max(0, y),
             min(frame_width, x + width), min(frame_height, y + height),
         )
+
+    def _start_sam2_camera(self, source: str, image_bgr: np.ndarray) -> None:
+        """Start a SAM2 video/camera session cropped to the pallet ROI.
+
+        Used only by ``run_video``: a still image never starts a camera
+        session (see ``run_image``'s image-only discovery path instead).
+        """
+        self._sam2_measurement_cache.clear()
+        crop_box = self._sam2_crop_box(image_bgr)
         self.sam2_manager.start_camera(
             self.config.sizing.camera_id,
             source,
@@ -536,15 +536,28 @@ class IntegratedFruitSizingPipeline:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         if self.config.inference_mode == "sam2_video":
             image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-            full_image_instances, timing = self.sam2_manager.process_frame(
-                self.config.sizing.camera_id,
-                image_rgb,
-                frame_index if frame_index is not None else 0,
-            )
-            logger.info(
-                "SAM2 frame %s: discovery=%.1fms propagation=%.1fms",
-                frame_index, timing.discovery_ms, timing.propagation_ms,
-            )
+            if frame_index is None:
+                # Image-only request: automatic mask generation + filtering
+                # only. Never starts a video predictor state, registers
+                # tracking objects, or builds frame history -- see
+                # SAM2ModelManager.discover_image().
+                self._sam2_measurement_cache.clear()
+                crop_box = self._sam2_crop_box(image_bgr)
+                full_image_instances, timing = self.sam2_manager.discover_image(
+                    image_rgb, crop_box=crop_box,
+                )
+                logger.info(
+                    "SAM2 image discovery: %.1fms (%d fruit(s))",
+                    timing.discovery_ms, len(full_image_instances),
+                )
+            else:
+                full_image_instances, timing = self.sam2_manager.process_frame(
+                    self.config.sizing.camera_id, image_rgb, frame_index,
+                )
+                logger.info(
+                    "SAM2 frame %s: discovery=%.1fms propagation=%.1fms",
+                    frame_index, timing.discovery_ms, timing.propagation_ms,
+                )
         else:
             detection_config = replace(
                 self.config.detection,

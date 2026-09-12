@@ -348,6 +348,11 @@ def test_auto_capacity_defaults_never_scale_fruit_count_by_vram(monkeypatch):
 
 
 def test_registration_is_chunked_by_tracking_object_batch_size_but_covers_all_objects():
+    """Chunking must never drop objects, but must also not call
+    ``empty_cache()`` per chunk: add_new_mask is already a small, sequential,
+    one-object call, so an interim cache flush would only cost throughput
+    without freeing anything -- see _register_instances' docstring.
+    """
     predictor = _FakePredictor()
     generator = _ManyMasksGenerator(5)
     config = SAM2Config(
@@ -364,7 +369,7 @@ def test_registration_is_chunked_by_tracking_object_batch_size_but_covers_all_ob
 
     assert len(instances) == 5
     assert len(predictor.prompts) == 5
-    assert len(release_calls) == 2  # ceil(5 / 2) - 1 interim flushes between chunks
+    assert release_calls == []
 
 
 class _DynamicFakePredictor:
@@ -459,3 +464,89 @@ def test_periodic_refresh_releases_old_state_but_preserves_instance_ids():
     assert predictor.init_state_calls[-1] == {
         "offload_video_to_cpu": True, "offload_state_to_cpu": True,
     }
+
+
+def test_discovery_defaults_are_balanced_not_expensive():
+    """points_per_side=64 + crop_n_layers=1 measured well over a minute per
+    image; the balanced default is far cheaper and still configurable up.
+    """
+    config = SAM2Config(device="cpu")
+    assert config.points_per_side == 32
+    assert config.crop_n_layers == 0
+    assert config.pred_iou_thresh == 0.80
+    assert config.stability_score_thresh == 0.90
+
+
+class _VideoOnlyPredictor:
+    """Raises if any video-predictor API is touched -- proves image-mode
+    discovery never initializes tracking state or registers objects.
+    """
+
+    def init_state(self, *args, **kwargs):
+        raise AssertionError("discover_image must not call init_state")
+
+    def add_new_mask(self, *args, **kwargs):
+        raise AssertionError("discover_image must not call add_new_mask")
+
+    def reset_state(self, *args, **kwargs):
+        raise AssertionError("discover_image must not call reset_state")
+
+    def propagate_frame(self, *args, **kwargs):
+        raise AssertionError("discover_image must not call propagate_frame")
+
+
+def test_discover_image_never_touches_the_video_predictor():
+    predictor = _VideoOnlyPredictor()
+    generator = _ManyMasksGenerator(220)
+    config = SAM2Config(device="cpu", min_mask_region_area=1)
+    manager = SAM2ModelManager(config, predictor=predictor, generator=generator)
+    image = np.zeros((400, 400, 3), dtype=np.uint8)
+
+    instances, timing = manager.discover_image(image)
+
+    assert len(instances) == 220
+    assert [item.instance_id for item in instances] == list(range(1, 221))
+    assert timing.discovery_ms > 0
+    assert timing.propagation_ms == 0.0
+
+
+def test_discover_image_does_not_truncate_proposals_based_on_gpu_vram():
+    predictor = _VideoOnlyPredictor()
+    generator = _ManyMasksGenerator(220)
+    config = SAM2Config(
+        device="cpu", min_mask_region_area=1, max_active_objects_per_camera=5,
+    )
+    manager = SAM2ModelManager(config, predictor=predictor, generator=generator)
+    image = np.zeros((400, 400, 3), dtype=np.uint8)
+
+    instances, _ = manager.discover_image(image)
+
+    assert len(instances) == 220
+
+
+def test_add_new_mask_retries_once_after_cuda_oom_then_clears_cache():
+    class _FlakyPredictor(_FakePredictor):
+        def __init__(self):
+            super().__init__()
+            self.failed_once_for: set[int] = set()
+
+        def add_new_mask(self, state, frame_idx, obj_id, mask):
+            if obj_id not in self.failed_once_for:
+                self.failed_once_for.add(obj_id)
+                raise torch.cuda.OutOfMemoryError("simulated OOM")
+            super().add_new_mask(state, frame_idx, obj_id, mask)
+
+    predictor = _FlakyPredictor()
+    generator = _FakeGenerator()
+    config = SAM2Config(device="cpu", refresh_seconds=999, min_mask_region_area=1)
+    manager = SAM2ModelManager(config, predictor=predictor, generator=generator)
+    manager.start_camera("cam", "video.mp4", (50, 60))
+    image = np.zeros((50, 60, 3), dtype=np.uint8)
+    release_calls = []
+    manager.release_unused_cuda_memory = lambda: release_calls.append(1)
+
+    instances, _ = manager.process_frame("cam", image, 0)
+
+    assert len(instances) == 1
+    assert len(predictor.prompts) == 1  # the retry succeeded, registration completed
+    assert release_calls == [1]  # empty_cache called only for OOM recovery
