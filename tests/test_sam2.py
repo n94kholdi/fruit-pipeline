@@ -138,3 +138,126 @@ def test_resolution_change_resets_camera_state():
     with pytest.raises(RuntimeError, match="resolution/crop/model changed"):
         manager.process_frame("cam", np.zeros((51, 60, 3), np.uint8), 0)
     assert predictor.reset is True
+
+
+class _SequencedGenerator:
+    """Returns a different discovery batch on each successive call."""
+
+    def __init__(self, batches):
+        self._batches = batches
+        self.calls = 0
+
+    def generate(self, image):
+        batch = self._batches[min(self.calls, len(self._batches) - 1)]
+        self.calls += 1
+        return batch
+
+
+class _TrackingStartsFakePredictor:
+    """Mirrors the real SAM2VideoPredictor's new-object-after-tracking guard."""
+
+    def __init__(self, shape=(50, 60)):
+        self.shape = shape
+        self.known_ids: set[int] = set()
+        self.reset_calls = 0
+
+    def init_state(self, video_path):
+        return {"tracking_has_started": False}
+
+    def add_new_mask(self, state, frame_idx, obj_id, mask):
+        if obj_id not in self.known_ids and state["tracking_has_started"]:
+            raise RuntimeError(
+                f"Cannot add new object id {obj_id} after tracking starts. "
+                "Please call 'reset_state' to restart from scratch."
+            )
+        self.known_ids.add(obj_id)
+
+    def propagate_frame(self, state, frame_index):
+        state["tracking_has_started"] = True
+        height, width = self.shape
+        logits = np.full((1, 1, height, width), -1.0, dtype=np.float32)
+        logits[:, :, 5:15, 6:16] = 1.0
+        return [1], logits
+
+    def reset_state(self, state):
+        state["tracking_has_started"] = False
+        self.known_ids.clear()
+
+
+def _mask_region(y1, x1, y2, x2, shape=(50, 60)):
+    mask = np.zeros(shape, dtype=bool)
+    mask[y1:y2, x1:x2] = True
+    return mask
+
+
+class _FakeImagePredictor:
+    """Reproduces SAM2ImagePredictor.predict()'s own squeeze(0) quirk.
+
+    Its wrapper only squeezes away the leading per-call box axis, so with
+    multimask_output=False a single-box call keeps the mask-count axis
+    instead -- (1, H, W) / (1,) -- while a multi-box call keeps the box axis
+    -- (len(box), 1, H, W) / (len(box), 1).
+    """
+
+    def __init__(self, shape=(50, 60)):
+        self.shape = shape
+        self.box_counts_seen: list[int] = []
+
+    def set_image(self, image):
+        pass
+
+    def predict(self, box, multimask_output):
+        assert multimask_output is False
+        count = np.asarray(box).shape[0]
+        self.box_counts_seen.append(count)
+        height, width = self.shape
+        masks = np.zeros((count, 1, height, width), dtype=bool)
+        scores = np.full((count, 1), 0.9, dtype=np.float32)
+        # torch.Tensor.squeeze(0) (what predict() really calls) is a no-op
+        # when dim 0 isn't size 1, unlike numpy's axis-checked squeeze.
+        def squeeze0(arr):
+            return arr[0] if arr.shape[0] == 1 else arr
+
+        return squeeze0(masks), squeeze0(scores), None
+
+
+def test_segment_boxes_handles_single_box_and_multi_box_chunks():
+    manager = SAM2ModelManager(SAM2Config(device="cpu"))
+    image = np.zeros((50, 60, 3), dtype=np.uint8)
+    boxes = np.array([[0, 0, 5, 5], [1, 1, 6, 6], [2, 2, 7, 7]], dtype=np.float32)
+
+    fake = _FakeImagePredictor()
+    manager._image_predictor = fake
+    masks, scores = manager.segment_boxes(image, boxes, batch_size=1)
+    assert fake.box_counts_seen == [1, 1, 1]
+    assert masks.shape == (3, 50, 60)
+    assert scores.shape == (3,)
+
+    fake = _FakeImagePredictor()
+    manager._image_predictor = fake
+    masks, scores = manager.segment_boxes(image, boxes, batch_size=16)
+    assert fake.box_counts_seen == [3]
+    assert masks.shape == (3, 50, 60)
+    assert scores.shape == (3,)
+
+
+def test_discover_resets_state_before_adding_an_object_found_after_tracking_started():
+    predictor = _TrackingStartsFakePredictor()
+    generator = _SequencedGenerator([
+        [{"segmentation": _mask_region(5, 6, 15, 16), "predicted_iou": 0.9}],
+        [
+            {"segmentation": _mask_region(5, 6, 15, 16), "predicted_iou": 0.9},
+            {"segmentation": _mask_region(30, 40, 40, 50), "predicted_iou": 0.9},
+        ],
+    ])
+    config = SAM2Config(device="cpu", refresh_seconds=999, min_mask_region_area=1)
+    manager = SAM2ModelManager(config, predictor=predictor, generator=generator)
+    manager.start_camera("cam", "video.mp4", (50, 60))
+    image = np.zeros((50, 60, 3), dtype=np.uint8)
+
+    manager.process_frame("cam", image, 0)  # initial discovery: object 1
+    manager.process_frame("cam", image, 1)  # propagates -> tracking_has_started = True
+
+    instances, _ = manager.process_frame("cam", image, 2, force_refresh=True)
+
+    assert {item.instance_id for item in instances} == {1, 2}

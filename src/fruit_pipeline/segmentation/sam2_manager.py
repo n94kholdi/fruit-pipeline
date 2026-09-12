@@ -235,12 +235,22 @@ class SAM2ModelManager:
             mask_chunks: list[np.ndarray] = []
             score_chunks: list[np.ndarray] = []
             for start in range(0, len(boxes_np), batch_size):
+                chunk = boxes_np[start : start + batch_size]
                 masks, scores, _ = predictor.predict(
-                    box=boxes_np[start : start + batch_size],
+                    box=chunk,
                     multimask_output=False,
                 )
-                mask_chunks.append(np.asarray(masks).squeeze(1))
-                score_chunks.append(np.asarray(scores).squeeze(1))
+                # SAM2ImagePredictor.predict() only squeezes away its leading
+                # per-call batch axis, so with multimask_output=False a
+                # single-box chunk keeps the mask-count axis instead --
+                # (1, H, W) / (1,) -- while a multi-box chunk keeps the box
+                # axis -- (len(chunk), 1, H, W) / (len(chunk), 1).
+                if len(chunk) == 1:
+                    mask_chunks.append(np.asarray(masks)[None, 0])
+                    score_chunks.append(np.atleast_1d(np.asarray(scores)))
+                else:
+                    mask_chunks.append(np.asarray(masks).squeeze(1))
+                    score_chunks.append(np.asarray(scores).squeeze(1))
             if not mask_chunks:
                 height, width = image_rgb.shape[:2]
                 return np.empty((0, height, width), dtype=bool), np.empty((0,), dtype=np.float32)
@@ -344,11 +354,22 @@ class SAM2ModelManager:
             raise RuntimeError("SAM2_MAX_TOTAL_ACTIVE_OBJECTS capacity reached")
         state.instances = reconciled.instances
         state.lifecycle_events.extend(event.__dict__ for event in reconciled.events)
-        for event in reconciled.events:
-            if event.event == "removed" and hasattr(self._predictor, "remove_object"):
-                self._predictor.remove_object(
-                    state.inference_state, event.instance_id, strict=False, need_output=False
-                )
+        introduces_new_object = any(event.event == "discovered" for event in reconciled.events)
+        if introduces_new_object and state.inference_state.get("tracking_has_started"):
+            # SAM2's video predictor only allows registering object ids before
+            # the first propagate call ("Cannot add new object id ... after
+            # tracking starts"). reset_state() clears only that per-object
+            # bookkeeping -- the buffered video frames are untouched -- so a
+            # later refresh that finds a genuinely new fruit can safely
+            # re-register every still-known instance at the current frame
+            # instead of crashing.
+            self._predictor.reset_state(state.inference_state)
+        else:
+            for event in reconciled.events:
+                if event.event == "removed" and hasattr(self._predictor, "remove_object"):
+                    self._predictor.remove_object(
+                        state.inference_state, event.instance_id, strict=False, need_output=False
+                    )
         for instance in state.instances:
             if instance.tracking_state != "uncertain":
                 self._predictor.add_new_mask(
