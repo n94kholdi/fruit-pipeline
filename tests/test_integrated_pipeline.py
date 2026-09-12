@@ -402,13 +402,45 @@ def test_sam2_video_releases_camera_state_even_if_a_frame_raises(tmp_path, monke
     assert manager.stop_calls == ["cam_001"]
 
 
-def test_run_image_rejects_sam2_video_mode(tmp_path):
+def test_run_image_supports_sam2_video_mode(tmp_path):
+    """A still image is a one-frame "video": one discovery pass, then teardown."""
+    image_path = tmp_path / "fruit.jpg"
+    cv2.imwrite(str(image_path), np.zeros((240, 160, 3), np.uint8))
+    config = _sam2_config(tmp_path, image_path)
+    mask = _fruit_mask(40, 81, 30, 51)
+    manager = _FakeSAM2Manager({
+        0: [FruitInstance(1, [30, 40, 51, 81], 1.0, "fruit", 1.0, mask,
+                           confidence=0.9, first_seen_frame=0, last_seen_frame=0,
+                           last_discovery_frame=0, tracking_state="discovered")],
+    })
+
+    result = IntegratedFruitSizingPipeline(config, sam2_manager=manager).run(image_path)
+
+    assert len(manager.start_calls) == 1
+    camera_id, source, frame_shape, crop_box = manager.start_calls[0]
+    assert (camera_id, source, frame_shape) == ("cam_001", str(image_path), (240, 160))
+    assert manager.process_calls == [("cam_001", 0)]
+    assert manager.stop_calls == ["cam_001"]
+    assert len(result.frames) == 1
+    assert result.frames[0].num_fruits == 1
+    assert result.frames[0].to_dict()["fruits"][0]["tracking_state"] == "discovered"
+
+
+def test_run_image_releases_camera_state_even_if_processing_raises(tmp_path):
     image_path = tmp_path / "fruit.jpg"
     cv2.imwrite(str(image_path), np.zeros((240, 160, 3), np.uint8))
     config = _sam2_config(tmp_path, image_path)
 
-    with pytest.raises(ValueError, match="sam2_video requires a video or live stream"):
-        IntegratedFruitSizingPipeline(config, sam2_manager=_FakeSAM2Manager({})).run(image_path)
+    class _RaisingManager(_FakeSAM2Manager):
+        def process_frame(self, camera_id, image_rgb, frame_index, **kwargs):
+            raise RuntimeError("SAM2 discovery failure")
+
+    manager = _RaisingManager({})
+
+    with pytest.raises(RuntimeError, match="SAM2 discovery failure"):
+        IntegratedFruitSizingPipeline(config, sam2_manager=manager).run(image_path)
+
+    assert manager.stop_calls == ["cam_001"]
 
 
 def test_sam2_propagated_frames_reuse_measurement_until_mask_changes(tmp_path, monkeypatch):

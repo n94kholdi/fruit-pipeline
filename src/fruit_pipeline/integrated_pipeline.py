@@ -58,8 +58,10 @@ class IntegratedPipelineConfig:
 
     Set ``detection`` (a ``PipelineConfig``) for the original detector +
     box-prompted-SAM2 pipeline, or ``sam2_video`` (a ``SAM2Config``) for the
-    detector-free video path where SAM2 discovers and propagates instances.
-    Exactly one of the two must be provided -- ``inference_mode`` reports which.
+    detector-free SAM2 path where SAM2 discovers instances itself -- a single
+    automatic-mask-generator pass on a still image, or discovery plus
+    propagation across a video/live stream. Exactly one of the two must be
+    provided -- ``inference_mode`` reports which.
     """
 
     sizing: SizeEstimationConfig
@@ -333,8 +335,6 @@ class IntegratedFruitSizingPipeline:
         return self.run_video(source_text)
 
     def run_image(self, image_path: str | Path) -> MediaResult:
-        if self.config.inference_mode == "sam2_video":
-            raise ValueError("sam2_video requires a video or live stream; use detection for a still image")
         path = Path(image_path)
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None:
@@ -350,13 +350,25 @@ class IntegratedFruitSizingPipeline:
                 raise OSError(f"Cannot write normalized input: {processing_path}")
         self.prepare_pallet(image)
         self._ensure_models(str(processing_path))
-        frame = self._process_frame(
-            image,
-            processing_path,
-            None,
-            None,
-            Path(self.config.output_dir),
-        )
+        is_sam2 = self.config.inference_mode == "sam2_video"
+        if is_sam2:
+            # A still image is just a one-frame "video": start a camera
+            # session so process_frame() runs its one-shot automatic
+            # discovery pass (no prior instances means no propagation), then
+            # tear the session down immediately -- no video-length state is
+            # kept resident between separate image requests.
+            self._start_sam2_camera(str(processing_path), image)
+        try:
+            frame = self._process_frame(
+                image,
+                processing_path,
+                None,
+                None,
+                Path(self.config.output_dir),
+            )
+        finally:
+            if is_sam2:
+                self.sam2_manager.stop_camera(self.config.sizing.camera_id)
         self._notify_frame(frame, image, 1, 1)
         result = MediaResult(str(path), str(self.config.pallet_selection_path), [frame])
         result.save(Path(self.config.output_dir) / f"{path.stem}_summary.json")
@@ -377,24 +389,7 @@ class IntegratedFruitSizingPipeline:
             self.prepare_pallet(self._normalize_frame(first_frame))
             self._ensure_models(source)
             if self.config.inference_mode == "sam2_video":
-                self._sam2_measurement_cache.clear()
-                normalized_first = self._normalize_frame(first_frame)
-                corners = self.pallet_detector.detect(normalized_first).corners_px
-                frame_height, frame_width = normalized_first.shape[:2]
-                x, y, width, height = cv2.boundingRect(np.round(corners).astype(np.int32))
-                # Clamp to the frame: a pallet ROI detected flush against the
-                # edge can otherwise push the box one pixel out of bounds.
-                crop_box = (
-                    max(0, x), max(0, y),
-                    min(frame_width, x + width), min(frame_height, y + height),
-                )
-                self.sam2_manager.start_camera(
-                    self.config.sizing.camera_id,
-                    source,
-                    normalized_first.shape[:2],
-                    crop_box,
-                    cv2.cvtColor(normalized_first, cv2.COLOR_BGR2RGB),
-                )
+                self._start_sam2_camera(source, self._normalize_frame(first_frame))
 
             raw_frame_count_value = float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
             raw_frame_count = (
@@ -497,6 +492,30 @@ class IntegratedFruitSizingPipeline:
                 applied_rotation,
             )
         return normalized
+
+    def _start_sam2_camera(self, source: str, image_bgr: np.ndarray) -> None:
+        """Start a SAM2 camera session cropped to the pallet ROI for ``image_bgr``.
+
+        Shared by ``run_image`` (a one-shot discovery pass, stopped right
+        after) and ``run_video`` (discovery plus propagation across frames).
+        """
+        self._sam2_measurement_cache.clear()
+        corners = self.pallet_detector.detect(image_bgr).corners_px
+        frame_height, frame_width = image_bgr.shape[:2]
+        x, y, width, height = cv2.boundingRect(np.round(corners).astype(np.int32))
+        # Clamp to the frame: a pallet ROI detected flush against the edge
+        # can otherwise push the box one pixel out of bounds.
+        crop_box = (
+            max(0, x), max(0, y),
+            min(frame_width, x + width), min(frame_height, y + height),
+        )
+        self.sam2_manager.start_camera(
+            self.config.sizing.camera_id,
+            source,
+            image_bgr.shape[:2],
+            crop_box,
+            cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB),
+        )
 
     def _ensure_models(self, image_path: str) -> None:
         if self.config.inference_mode == "sam2_video":

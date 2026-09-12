@@ -65,6 +65,66 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     return value
 
 
+def _env_int_or_auto(name: str, auto_default: int, minimum: int = 0) -> int:
+    """Like ``_env_int``, but the fallback is a computed value, not a constant."""
+    raw = os.getenv(name)
+    value = int(raw) if raw is not None else auto_default
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return value
+
+
+def _detected_gpu_memory_gb() -> float | None:
+    """Total VRAM of the resident CUDA device, or ``None`` if it can't be probed."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.get_device_properties(0).total_memory / 1024**3
+    except Exception:
+        return None
+
+
+def _auto_capacity_defaults() -> dict[str, int]:
+    """SAM2 video-mode capacity ceilings, scaled to the resident GPU's VRAM.
+
+    The historical hardcoded ceilings (8 cameras / 256 objects-per-camera /
+    1024 total / 32-frame history) were sized for a large data-center GPU.
+    SAM2 video mode keeps a per-object memory-bank resident on GPU for the
+    whole frame history, so handing those same ceilings to a small card (a
+    5.8GB laptop/edge GPU, say) lets active objects and frame history grow
+    across a session until CUDA runs out of memory -- typically with the
+    "reserved but unallocated" fragmentation symptom, well before any
+    ceiling itself is hit. Scaling these down for a smaller card -- and
+    back up automatically on a bigger one -- means the same image doesn't
+    need per-machine env var tuning. Any of the four corresponding env vars
+    still wins outright when set explicitly; this is only the fallback.
+    """
+    total_gb = _detected_gpu_memory_gb()
+    if total_gb is None:
+        return {
+            "max_cameras_per_gpu": 8,
+            "max_active_objects_per_camera": 256,
+            "max_total_active_objects": 1024,
+            "max_frame_history": 32,
+        }
+    # Reference point: the historical ceilings above assume a ~24GB card.
+    scale = max(0.15, min(1.0, total_gb / 24.0))
+    if total_gb < 10.0:
+        cameras = 1
+    elif total_gb < 20.0:
+        cameras = 4
+    else:
+        cameras = 8
+    return {
+        "max_cameras_per_gpu": cameras,
+        "max_active_objects_per_camera": max(16, round(256 * scale)),
+        "max_total_active_objects": max(16, round(1024 * scale)),
+        "max_frame_history": max(6, round(32 * scale)),
+    }
+
+
 @dataclass(frozen=True)
 class SAM2Config:
     model_name: str = "sam2.1_hiera_base_plus"
@@ -142,6 +202,7 @@ class SAM2Config:
     @classmethod
     def from_env(cls) -> "SAM2Config":
         model = os.getenv("FRUIT_PIPELINE_SAM2_MODEL", "sam2.1_hiera_base_plus")
+        auto_capacity = _auto_capacity_defaults()
         return cls(
             model_name=model,
             checkpoint=os.getenv("FRUIT_PIPELINE_SAM2_CHECKPOINT") or None,
@@ -159,13 +220,21 @@ class SAM2Config:
             refresh_jitter_seconds=_env_float("SAM2_REFRESH_JITTER_SECONDS", 1.0),
             min_refresh_interval_seconds=_env_float("SAM2_MIN_REFRESH_INTERVAL_SECONDS", 2.0),
             max_refresh_queue=_env_int("SAM2_MAX_REFRESH_QUEUE", 32, 1),
-            max_cameras_per_gpu=_env_int("SAM2_MAX_CAMERAS_PER_GPU", 8, 1),
-            max_active_objects_per_camera=_env_int("SAM2_MAX_ACTIVE_OBJECTS_PER_CAMERA", 256, 1),
-            max_total_active_objects=_env_int("SAM2_MAX_TOTAL_ACTIVE_OBJECTS", 1024, 1),
+            max_cameras_per_gpu=_env_int_or_auto(
+                "SAM2_MAX_CAMERAS_PER_GPU", auto_capacity["max_cameras_per_gpu"], 1
+            ),
+            max_active_objects_per_camera=_env_int_or_auto(
+                "SAM2_MAX_ACTIVE_OBJECTS_PER_CAMERA", auto_capacity["max_active_objects_per_camera"], 1
+            ),
+            max_total_active_objects=_env_int_or_auto(
+                "SAM2_MAX_TOTAL_ACTIVE_OBJECTS", auto_capacity["max_total_active_objects"], 1
+            ),
             max_concurrent_discoveries=_env_int("SAM2_MAX_CONCURRENT_DISCOVERIES", 1, 1),
             max_gpu_queue=_env_int("SAM2_MAX_GPU_QUEUE", 64, 1),
             camera_idle_timeout_seconds=_env_float("SAM2_CAMERA_IDLE_TIMEOUT_SECONDS", 60.0, 1),
-            max_frame_history=_env_int("SAM2_MAX_FRAME_HISTORY", 32, 2),
+            max_frame_history=_env_int_or_auto(
+                "SAM2_MAX_FRAME_HISTORY", auto_capacity["max_frame_history"], 2
+            ),
             missing_grace_refreshes=_env_int("SAM2_MISSING_GRACE_REFRESHS", 2),
             require_cuda_extension=env_flag("SAM2_REQUIRE_CUDA_EXTENSION", False),
         )

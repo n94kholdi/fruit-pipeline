@@ -137,6 +137,17 @@ due first. Thirty source frames at 30 FPS is one second; 30 processed frames at
 the selected model, actual precision/runtime, compilation state, load time,
 VRAM, active state, discovery settings, and refresh queue counters.
 
+Of those, `SAM2_MAX_CAMERAS_PER_GPU`, `SAM2_MAX_ACTIVE_OBJECTS_PER_CAMERA`,
+`SAM2_MAX_TOTAL_ACTIVE_OBJECTS`, and `SAM2_MAX_FRAME_HISTORY` are, by default,
+**auto-sized from the resident GPU's detected VRAM** (see
+`sam2_config._auto_capacity_defaults`) instead of using a single fixed value —
+video mode keeps a per-object memory-bank resident on GPU for the whole frame
+history, so a ceiling sized for a large card can fragment/OOM a small one
+well before the ceiling itself is reached. Leave all four unset to get sizing
+appropriate to whatever GPU the container actually has; set any of them
+explicitly (env var, or via `docker-compose.production.yml`'s `env_file`) to
+pin a specific ceiling instead.
+
 `SAM2_RUNTIME=pytorch` is the required baseline. `hybrid` and `tensorrt` are
 experimental and require an offline-built, checksum/config/GPU-compatible
 engine manifest under `SAM2_TENSORRT_ENGINE_DIR`. An absent or incompatible
