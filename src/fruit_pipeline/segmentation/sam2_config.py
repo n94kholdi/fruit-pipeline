@@ -89,24 +89,29 @@ def _detected_gpu_memory_gb() -> float | None:
 def _auto_capacity_defaults() -> dict[str, int]:
     """SAM2 video-mode capacity ceilings, scaled to the resident GPU's VRAM.
 
-    The historical hardcoded ceilings (8 cameras / 256 objects-per-camera /
-    1024 total / 32-frame history) were sized for a large data-center GPU.
-    SAM2 video mode keeps a per-object memory-bank resident on GPU for the
-    whole frame history, so handing those same ceilings to a small card (a
-    5.8GB laptop/edge GPU, say) lets active objects and frame history grow
-    across a session until CUDA runs out of memory -- typically with the
-    "reserved but unallocated" fragmentation symptom, well before any
-    ceiling itself is hit. Scaling these down for a smaller card -- and
-    back up automatically on a bigger one -- means the same image doesn't
-    need per-machine env var tuning. Any of the four corresponding env vars
-    still wins outright when set explicitly; this is only the fallback.
+    Only concurrency/throughput knobs are scaled here -- how many cameras run
+    at once, how many objects are pushed through the tracker in one batch,
+    and how many frames of memory-bank history stay resident. SAM2 video mode
+    keeps a per-object memory-bank resident on GPU for the whole frame
+    history, so a small card (a 5.8GB laptop/edge GPU, say) needs a shorter
+    history and smaller tracking batches than a data-center GPU to avoid
+    growing until CUDA runs out of memory. Scaling these down for a smaller
+    card -- and back up automatically on a bigger one -- means the same
+    image doesn't need per-machine env var tuning.
+
+    Deliberately absent from this scaling: how many fruits a discovery pass
+    is allowed to return. The number of fruits in a scene is a property of
+    the scene, not the GPU, so ``max_active_objects_per_camera`` and
+    ``max_total_active_objects`` use fixed, generous defaults instead (see
+    ``SAM2Config``) -- VRAM controls tracking batch size, not detection
+    count. Any of the corresponding env vars still wins outright when set
+    explicitly; this is only the fallback.
     """
     total_gb = _detected_gpu_memory_gb()
     if total_gb is None:
         return {
             "max_cameras_per_gpu": 8,
-            "max_active_objects_per_camera": 256,
-            "max_total_active_objects": 1024,
+            "tracking_object_batch_size": 64,
             "max_frame_history": 32,
         }
     # Reference point: the historical ceilings above assume a ~24GB card.
@@ -119,8 +124,7 @@ def _auto_capacity_defaults() -> dict[str, int]:
         cameras = 8
     return {
         "max_cameras_per_gpu": cameras,
-        "max_active_objects_per_camera": max(16, round(256 * scale)),
-        "max_total_active_objects": max(16, round(1024 * scale)),
+        "tracking_object_batch_size": max(8, round(64 * scale)),
         "max_frame_history": max(6, round(32 * scale)),
     }
 
@@ -145,24 +149,41 @@ class SAM2Config:
     min_refresh_interval_seconds: float = 2.0
     max_refresh_queue: int = 32
     max_cameras_per_gpu: int = 8
-    max_active_objects_per_camera: int = 256
-    max_total_active_objects: int = 1024
+    # Fixed, VRAM-independent sanity ceilings: the number of fruits in a
+    # scene is a property of the scene, not the GPU, so these are generous
+    # constants rather than values scaled down for a small card. See
+    # ``tracking_object_batch_size`` for the knob that actually controls how
+    # much GPU memory a discovery's objects consume at once.
+    max_active_objects_per_camera: int = 4096
+    max_total_active_objects: int = 16384
     max_concurrent_discoveries: int = 1
     max_gpu_queue: int = 64
     camera_idle_timeout_seconds: float = 60.0
     max_frame_history: int = 32
+    # How many tracked objects are registered/propagated per SAM2 call before
+    # an interim CUDA cache flush. Bounds peak VRAM for the tracking stage
+    # without ever dropping detections -- objects beyond one chunk are
+    # processed in the next chunk, not discarded.
+    tracking_object_batch_size: int = 64
+    # SAM2 video state offloading. CPU-offloaded state keeps per-object,
+    # per-frame memory-bank tensors off the GPU except while actively used,
+    # which is the main lever for bounding VRAM growth across a long stream.
+    offload_video_to_cpu: bool = True
+    offload_state_to_cpu: bool = True
     missing_grace_refreshes: int = 2
     match_mask_iou: float = 0.35
     match_box_iou: float = 0.20
     match_centroid_distance: float = 2.0
 
-    points_per_side: int = 32
+    points_per_side: int = 64
     points_per_batch: int = 64
-    pred_iou_thresh: float = 0.88
-    stability_score_thresh: float = 0.95
+    pred_iou_thresh: float = 0.80
+    stability_score_thresh: float = 0.90
     box_nms_thresh: float = 0.7
     min_mask_region_area: int = 30
+    crop_n_layers: int = 1
     require_cuda_extension: bool = False
+    debug_memory: bool = False
 
     def __post_init__(self) -> None:
         if self.model_name not in SAM2_VARIANTS:
@@ -197,6 +218,7 @@ class SAM2Config:
             "stability_score_thresh": self.stability_score_thresh,
             "box_nms_thresh": self.box_nms_thresh,
             "min_mask_region_area": self.min_mask_region_area,
+            "crop_n_layers": self.crop_n_layers,
         }
 
     @classmethod
@@ -223,18 +245,30 @@ class SAM2Config:
             max_cameras_per_gpu=_env_int_or_auto(
                 "SAM2_MAX_CAMERAS_PER_GPU", auto_capacity["max_cameras_per_gpu"], 1
             ),
-            max_active_objects_per_camera=_env_int_or_auto(
-                "SAM2_MAX_ACTIVE_OBJECTS_PER_CAMERA", auto_capacity["max_active_objects_per_camera"], 1
-            ),
-            max_total_active_objects=_env_int_or_auto(
-                "SAM2_MAX_TOTAL_ACTIVE_OBJECTS", auto_capacity["max_total_active_objects"], 1
-            ),
+            # Fixed defaults -- deliberately NOT derived from GPU VRAM. How
+            # many fruits a scene contains has nothing to do with GPU size;
+            # scaling this down auto-truncated real detections on small GPUs.
+            max_active_objects_per_camera=_env_int("SAM2_MAX_ACTIVE_OBJECTS_PER_CAMERA", 4096, 1),
+            max_total_active_objects=_env_int("SAM2_MAX_TOTAL_ACTIVE_OBJECTS", 16384, 1),
             max_concurrent_discoveries=_env_int("SAM2_MAX_CONCURRENT_DISCOVERIES", 1, 1),
             max_gpu_queue=_env_int("SAM2_MAX_GPU_QUEUE", 64, 1),
             camera_idle_timeout_seconds=_env_float("SAM2_CAMERA_IDLE_TIMEOUT_SECONDS", 60.0, 1),
             max_frame_history=_env_int_or_auto(
                 "SAM2_MAX_FRAME_HISTORY", auto_capacity["max_frame_history"], 2
             ),
+            tracking_object_batch_size=_env_int_or_auto(
+                "SAM2_TRACKING_OBJECT_BATCH_SIZE", auto_capacity["tracking_object_batch_size"], 1
+            ),
+            offload_video_to_cpu=env_flag("SAM2_OFFLOAD_VIDEO_TO_CPU", True),
+            offload_state_to_cpu=env_flag("SAM2_OFFLOAD_STATE_TO_CPU", True),
             missing_grace_refreshes=_env_int("SAM2_MISSING_GRACE_REFRESHS", 2),
+            points_per_side=_env_int("SAM2_POINTS_PER_SIDE", 64, 1),
+            points_per_batch=_env_int("SAM2_POINTS_PER_BATCH", 64, 1),
+            pred_iou_thresh=_env_float("SAM2_PRED_IOU_THRESH", 0.80),
+            stability_score_thresh=_env_float("SAM2_STABILITY_SCORE_THRESH", 0.90),
+            box_nms_thresh=_env_float("SAM2_BOX_NMS_THRESH", 0.7),
+            min_mask_region_area=_env_int("SAM2_MIN_MASK_REGION_AREA", 30),
+            crop_n_layers=_env_int("SAM2_CROP_N_LAYERS", 1),
             require_cuda_extension=env_flag("SAM2_REQUIRE_CUDA_EXTENSION", False),
+            debug_memory=env_flag("SAM2_DEBUG_MEMORY", False),
         )
