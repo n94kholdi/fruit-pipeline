@@ -32,6 +32,7 @@ from fruit_pipeline.live import FruitLiveReporter
 from fruit_pipeline.pallet_geometry.pallet_config import PalletTypeConfig
 from fruit_pipeline.segmentation.sam2_config import SAM2Config
 from fruit_pipeline.segmentation.sam2_manager import get_sam2_model_manager
+from fruit_pipeline.utils.env import env_flag
 
 
 DATA_DIR = Path(os.getenv("FRUIT_PIPELINE_DATA_DIR", "outputs/dashboard")).resolve()
@@ -47,6 +48,9 @@ if SERVICE_INFERENCE_MODE not in {"detector", "sam2_video"}:
 SAM2_CONFIG = SAM2Config.from_env()
 MAX_UPLOAD_BYTES = int(os.getenv("FRUIT_PIPELINE_MAX_UPLOAD_BYTES", str(1024**3)))
 WORKERS = max(1, int(os.getenv("FRUIT_PIPELINE_JOB_WORKERS", "1")))
+RELEASE_SAM2_AFTER_JOB = env_flag("SAM2_RELEASE_MODEL_AFTER_JOB", False)
+if RELEASE_SAM2_AFTER_JOB and WORKERS != 1:
+    raise ValueError("SAM2_RELEASE_MODEL_AFTER_JOB requires FRUIT_PIPELINE_JOB_WORKERS=1")
 MAX_CAPTURED_CALIBRATION_FRAMES = 300
 logger = logging.getLogger(__name__)
 
@@ -61,7 +65,11 @@ def preload_sam_model() -> None:
     required infrastructure regardless of which ``inference_mode`` a given job
     requests. Readiness failures are fatal by design.
     """
-    get_sam2_model_manager(SAM2_CONFIG, eager=True)
+    manager = get_sam2_model_manager(SAM2_CONFIG, eager=not RELEASE_SAM2_AFTER_JOB)
+    if RELEASE_SAM2_AFTER_JOB:
+        # Validate the selected checkpoint/runtime without occupying VRAM while
+        # the service is idle. The first job loads the model on demand.
+        manager.validate_readiness()
 
 
 _sam2_cleanup_stop = threading.Event()
@@ -515,6 +523,13 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
         else:
             _write_job(job_id, status="failed", error=str(exc))
             reporter.emit("job_failed", status="failed", message=str(exc))
+    finally:
+        manager = get_sam2_model_manager(SAM2_CONFIG, eager=False)
+        if RELEASE_SAM2_AFTER_JOB:
+            manager.unload()
+            logger.info("Released SAM2 model and CUDA cache after job %s", job_id)
+        else:
+            manager.release_unused_cuda_memory()
 
 
 @app.get("/health")

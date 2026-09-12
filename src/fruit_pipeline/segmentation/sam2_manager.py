@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib
 import json
@@ -230,31 +231,37 @@ class SAM2ModelManager:
         """
         predictor = self._get_image_predictor()
         with self._load_lock, torch.inference_mode(), self._autocast():
-            predictor.set_image(image_rgb)
-            boxes_np = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
-            mask_chunks: list[np.ndarray] = []
-            score_chunks: list[np.ndarray] = []
-            for start in range(0, len(boxes_np), batch_size):
-                chunk = boxes_np[start : start + batch_size]
-                masks, scores, _ = predictor.predict(
-                    box=chunk,
-                    multimask_output=False,
-                )
-                # SAM2ImagePredictor.predict() only squeezes away its leading
-                # per-call batch axis, so with multimask_output=False a
-                # single-box chunk keeps the mask-count axis instead --
-                # (1, H, W) / (1,) -- while a multi-box chunk keeps the box
-                # axis -- (len(chunk), 1, H, W) / (len(chunk), 1).
-                if len(chunk) == 1:
-                    mask_chunks.append(np.asarray(masks)[None, 0])
-                    score_chunks.append(np.atleast_1d(np.asarray(scores)))
-                else:
-                    mask_chunks.append(np.asarray(masks).squeeze(1))
-                    score_chunks.append(np.asarray(scores).squeeze(1))
-            if not mask_chunks:
-                height, width = image_rgb.shape[:2]
-                return np.empty((0, height, width), dtype=bool), np.empty((0,), dtype=np.float32)
-            return np.concatenate(mask_chunks), np.concatenate(score_chunks)
+            try:
+                predictor.set_image(image_rgb)
+                boxes_np = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+                mask_chunks: list[np.ndarray] = []
+                score_chunks: list[np.ndarray] = []
+                for start in range(0, len(boxes_np), batch_size):
+                    chunk = boxes_np[start : start + batch_size]
+                    masks, scores, _ = predictor.predict(
+                        box=chunk,
+                        multimask_output=False,
+                    )
+                    # SAM2ImagePredictor.predict() only squeezes away its leading
+                    # per-call batch axis, so with multimask_output=False a
+                    # single-box chunk keeps the mask-count axis instead --
+                    # (1, H, W) / (1,) -- while a multi-box chunk keeps the box
+                    # axis -- (len(chunk), 1, H, W) / (len(chunk), 1).
+                    if len(chunk) == 1:
+                        mask_chunks.append(np.asarray(masks)[None, 0])
+                        score_chunks.append(np.atleast_1d(np.asarray(scores)))
+                    else:
+                        mask_chunks.append(np.asarray(masks).squeeze(1))
+                        score_chunks.append(np.asarray(scores).squeeze(1))
+                if not mask_chunks:
+                    height, width = image_rgb.shape[:2]
+                    return np.empty((0, height, width), dtype=bool), np.empty((0,), dtype=np.float32)
+                return np.concatenate(mask_chunks), np.concatenate(score_chunks)
+            finally:
+                # SAM2ImagePredictor otherwise retains the most recent image
+                # embedding on the GPU for the lifetime of the API process.
+                if hasattr(predictor, "reset_predictor"):
+                    predictor.reset_predictor()
 
     def start_camera(self, camera_id: str, source: str, frame_shape: tuple[int, int],
                      crop_box: tuple[int, int, int, int] | None = None,
@@ -427,6 +434,42 @@ class SAM2ModelManager:
             with state.lock:
                 self._predictor.reset_state(state.inference_state)
                 state.instances.clear()
+                if isinstance(state.inference_state, dict):
+                    state.inference_state.clear()
+        self.release_unused_cuda_memory()
+
+    def release_unused_cuda_memory(self) -> None:
+        """Return unreferenced per-job CUDA blocks to the driver.
+
+        This retains the model weights for fast reuse.  ``torch.cuda.empty_cache``
+        only releases allocator cache; live tensors belonging to another active
+        camera remain untouched.
+        """
+        gc.collect()
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def unload(self) -> None:
+        """Drop all SAM2 weights and transient state from GPU memory.
+
+        Intended for single-worker deployments that prefer releasing VRAM
+        between jobs over keeping the model warm.
+        """
+        for camera_id in list(self._states):
+            self.stop_camera(camera_id)
+        with self._load_lock:
+            if self._image_predictor is not None and hasattr(
+                self._image_predictor, "reset_predictor"
+            ):
+                self._image_predictor.reset_predictor()
+            self._image_predictor = None
+            self._generator = None
+            self._predictor = None
+            self.actual_runtime = "pytorch"
+            self.engine_identity = None
+            self._engine_metadata = None
+            self.load_time_ms = 0.0
+        self.release_unused_cuda_memory()
 
     def cleanup_idle(self, now: float | None = None) -> list[str]:
         current = now or time.monotonic()
