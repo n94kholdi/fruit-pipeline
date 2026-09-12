@@ -339,8 +339,8 @@ def test_health_reports_sam2_status_when_selected(tmp_path, monkeypatch):
 
     payload = dashboard_api.health()
 
-    assert payload["inference_mode"] == "sam2_video"
-    assert payload["models_ready"] is True
+    assert payload["default_inference_mode"] == "sam2_video"
+    assert payload["models_ready"]["sam2_video"] is True
     assert payload["models"]["sam2_selected"] is True
     assert payload["sam2"] == {"model_name": config.model_name, "loaded": True}
 
@@ -358,10 +358,19 @@ def _save_calibration(calibration_dir: Path, camera_id: str) -> None:
     )
 
 
-def test_create_fruit_job_rejects_a_mode_the_worker_was_not_started_with(tmp_path, monkeypatch):
+def test_create_fruit_job_allows_a_mode_other_than_the_worker_default(tmp_path, monkeypatch):
+    """A single worker serves both modes off the shared SAM2 checkpoint.
+
+    ``SERVICE_INFERENCE_MODE`` only picks what gets eagerly preloaded at
+    startup; a per-job ``inference_mode`` that differs from it must still be
+    accepted (and only fail later if that mode's own model files are
+    missing), since runtime switching is not disabled -- see the git history
+    on this test for the older, rejecting behavior.
+    """
     monkeypatch.setattr(dashboard_api, "INPUT_DIR", tmp_path / "inputs")
     monkeypatch.setattr(dashboard_api, "CALIBRATION_DIR", tmp_path / "calibrations")
     monkeypatch.setattr(dashboard_api, "SERVICE_INFERENCE_MODE", "sam2_video")
+    monkeypatch.setattr(dashboard_api, "DETECTOR_WEIGHTS", str(tmp_path / "missing-yolo.pt"))
     input_folder = dashboard_api.INPUT_DIR / "input-01"
     input_folder.mkdir(parents=True)
     (input_folder / "source.jpg").touch()
@@ -370,8 +379,9 @@ def test_create_fruit_job_rejects_a_mode_the_worker_was_not_started_with(tmp_pat
     with pytest.raises(HTTPException) as excinfo:
         dashboard_api.create_fruit_job(_fruit_job_request(inference_mode="detector"))
 
-    assert excinfo.value.status_code == 422
-    assert "sam2_video" in str(excinfo.value.detail)
+    # Rejected for missing model files, not for the requested mode itself.
+    assert excinfo.value.status_code == 503
+    assert "missing-yolo.pt" in str(excinfo.value.detail)
 
 
 def test_sam2_idle_cleanup_loop_sweeps_immediately_and_stops_cleanly(monkeypatch):

@@ -54,17 +54,13 @@ for directory in (CALIBRATION_DIR, INPUT_DIR, JOB_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 def preload_sam_model() -> None:
-    """Populate the process-wide GPU cache before the first inference request."""
-    if SERVICE_INFERENCE_MODE == "sam2_video":
-        # Readiness failures are fatal by design when the SAM2 service is selected.
-        get_sam2_model_manager(SAM2_CONFIG, eager=True)
-        return
-    if not Path(SAM2_CONFIG.resolved_checkpoint).is_file():
-        logger.warning(
-            "SAM2 startup preload skipped; checkpoint is missing: %s",
-            SAM2_CONFIG.resolved_checkpoint,
-        )
-        return
+    """Populate the process-wide GPU cache before the first inference request.
+
+    SAM2 backs both the box-prompted detector path and the video-tracking
+    path off a single resident checkpoint (see ``SAM2ModelManager``), so it is
+    required infrastructure regardless of which ``inference_mode`` a given job
+    requests. Readiness failures are fatal by design.
+    """
     get_sam2_model_manager(SAM2_CONFIG, eager=True)
 
 
@@ -93,19 +89,18 @@ def _sam2_idle_cleanup_loop(manager) -> None:
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     preload_sam_model()
-    cleanup_thread: threading.Thread | None = None
-    if SERVICE_INFERENCE_MODE == "sam2_video":
-        manager = get_sam2_model_manager(SAM2_CONFIG, eager=False)
-        _sam2_cleanup_stop.clear()
-        cleanup_thread = threading.Thread(
-            target=_sam2_idle_cleanup_loop, args=(manager,),
-            daemon=True, name="sam2-idle-cleanup",
-        )
-        cleanup_thread.start()
+    # Idle camera state can accumulate from sam2_video jobs regardless of the
+    # worker's configured default mode, so this always runs.
+    manager = get_sam2_model_manager(SAM2_CONFIG, eager=False)
+    _sam2_cleanup_stop.clear()
+    cleanup_thread = threading.Thread(
+        target=_sam2_idle_cleanup_loop, args=(manager,),
+        daemon=True, name="sam2-idle-cleanup",
+    )
+    cleanup_thread.start()
     yield
     _sam2_cleanup_stop.set()
-    if cleanup_thread is not None:
-        cleanup_thread.join(timeout=5)
+    cleanup_thread.join(timeout=5)
 
 
 app = FastAPI(title="Tarebar Fruit Pipeline API", version="1.0.0", lifespan=_lifespan)
@@ -526,21 +521,20 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
 def health() -> dict[str, object]:
     detector_exists = Path(DETECTOR_WEIGHTS).is_file()
     sam2_exists = Path(SAM2_CONFIG.resolved_checkpoint).is_file()
-    selected_ready = {
+    modes_ready = {
         "detector": detector_exists and sam2_exists,
         "sam2_video": sam2_exists,
-    }[SERVICE_INFERENCE_MODE]
+    }
     payload = {
         "status": "ok",
-        "inference_mode": SERVICE_INFERENCE_MODE,
-        "models_ready": selected_ready,
+        "default_inference_mode": SERVICE_INFERENCE_MODE,
+        "models_ready": modes_ready,
         "models": {
             "detector": detector_exists,
             "sam2_selected": sam2_exists,
         },
+        "sam2": get_sam2_model_manager(SAM2_CONFIG, eager=False).status(),
     }
-    if SERVICE_INFERENCE_MODE == "sam2_video":
-        payload["sam2"] = get_sam2_model_manager(SAM2_CONFIG, eager=False).status()
     return payload
 
 
@@ -750,13 +744,6 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
     except CalibrationError as exc:
         raise HTTPException(404, str(exc)) from exc
     _validate_requested_pallet(request)
-    if request.inference_mode != SERVICE_INFERENCE_MODE:
-        raise HTTPException(
-            422,
-            f"This worker is configured for '{SERVICE_INFERENCE_MODE}'. Change "
-            "FRUIT_PIPELINE_INFERENCE_MODE and restart Docker to use another backend; "
-            "runtime model switching is disabled to protect GPU VRAM.",
-        )
     required_models = (
         (SAM2_CONFIG.resolved_checkpoint,) if request.inference_mode == "sam2_video" else
         (DETECTOR_WEIGHTS, SAM2_CONFIG.resolved_checkpoint)
