@@ -15,6 +15,7 @@ import time
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SAM2Timing:
+    frame_index: int = -1
+    mode: str = ""
+    refresh_reason: str | None = None
+    refresh_requested: bool = False
     discovery_ms: float = 0.0
     propagation_ms: float = 0.0
     total_frame_ms: float = 0.0
@@ -79,6 +84,18 @@ class CameraVideoState:
     dynamic_frames: bool = False
     predictor_frame_index: int = 0
     propagation_count: int = 0
+    discovery_count: int = 0
+    refresh_counts: dict[str, int] = field(
+        default_factory=lambda: {"periodic": 0, "tracking_failure": 0, "low_confidence": 0}
+    )
+    consecutive_failures: int = 0
+    current_refresh_reason: str | None = None
+    last_refresh_timestamp: str | None = None
+    last_tracking_confidence: float = 0.0
+    discovery_timings: deque[float] = field(default_factory=lambda: deque(maxlen=2048))
+    propagation_timings: deque[float] = field(default_factory=lambda: deque(maxlen=8192))
+    frame_timings: deque[float] = field(default_factory=lambda: deque(maxlen=8192))
+    session_started: float = field(default_factory=time.monotonic)
     lifecycle_events: list[dict[str, object]] = field(default_factory=list)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -350,6 +367,7 @@ class SAM2ModelManager:
         """
         state = self._get_state(camera_id)
         timing = SAM2Timing()
+        timing.frame_index = frame_index
         frame_started = time.perf_counter()
         state.last_activity = time.monotonic()
         with state.lock, torch.inference_mode(), self._autocast():
@@ -362,21 +380,33 @@ class SAM2ModelManager:
             due_frames = self.config.refresh_processed_frames > 0 and (
                 state.processed_frames == 1 or state.processed_frames % self.config.refresh_processed_frames == 0
             )
-            refresh = force_refresh or not state.instances or due_time or due_frames
+            refresh = (
+                force_refresh or not state.instances or due_time or due_frames
+                or self.refresh_queue.has(camera_id)
+            )
             if refresh:
-                reason = "initial" if not state.instances else refresh_reason
+                reason = "initial" if not state.instances else (
+                    refresh_reason if force_refresh else "periodic"
+                )
+                timing.mode = "discovery"
+                timing.refresh_reason = reason
                 self.refresh_queue.submit(camera_id, reason, now=now)
                 request = self.refresh_queue.take(camera_id)
                 if request is None:
                     if not state.instances:
                         raise RuntimeError("Initial SAM2 discovery was rejected by the bounded refresh queue")
+                    timing.mode = "propagation"
+                    timing.refresh_reason = None
                     predictor_frame_index = self._prepare_dynamic_frame(
                         state, image_rgb, frame_index, timing,
                     )
                     instances = self._propagate(state, frame_index, predictor_frame_index, timing)
                     self._latencies["propagation"].append(timing.propagation_ms)
+                    state.propagation_timings.append(timing.propagation_ms)
                     self._finalize_frame_timing(camera_id, timing, frame_started)
                     return instances, timing
+                reason = request.reason
+                timing.refresh_reason = reason
                 timing.queue_wait_ms = max(0.0, (time.monotonic() - request.requested_at) * 1000)
                 # A live/dynamic refresh creates a fresh one-frame state from
                 # image_rgb inside _discover. Do not first append this frame
@@ -388,6 +418,12 @@ class SAM2ModelManager:
                 )
                 instances = self._discover(state, image_rgb, frame_index, predictor_frame_index, timing)
                 self._latencies["discovery"].append(timing.discovery_ms)
+                state.discovery_timings.append(timing.discovery_ms)
+                state.discovery_count += 1
+                if reason in state.refresh_counts:
+                    state.refresh_counts[reason] += 1
+                state.current_refresh_reason = reason
+                state.last_refresh_timestamp = datetime.now(timezone.utc).isoformat()
                 state.last_discovery = now
                 state.last_discovery_frame = frame_index
                 state.next_refresh_due = _next_refresh_due(
@@ -402,6 +438,7 @@ class SAM2ModelManager:
             )
             instances = self._propagate(state, frame_index, predictor_frame_index, timing)
             self._latencies["propagation"].append(timing.propagation_ms)
+            state.propagation_timings.append(timing.propagation_ms)
             state.last_activity = now
             self._finalize_frame_timing(camera_id, timing, frame_started)
             return instances, timing
@@ -410,11 +447,19 @@ class SAM2ModelManager:
         self, camera_id: str, timing: SAM2Timing, frame_started: float,
     ) -> None:
         timing.total_frame_ms = (time.perf_counter() - frame_started) * 1000
+        state = self._get_state(camera_id)
+        state.frame_timings.append(timing.total_frame_ms)
         if self.device.type == "cuda" and torch.cuda.is_available():
             timing.cuda_allocated_mb = torch.cuda.memory_allocated(self.device) / 1024**2
             timing.cuda_reserved_mb = torch.cuda.memory_reserved(self.device) / 1024**2
             timing.cuda_peak_mb = torch.cuda.max_memory_allocated(self.device) / 1024**2
         self._log_timing(camera_id, timing)
+        logger.info(
+            "SAM2 FRAME %d: mode=%s reason=%s objects=%d confidence=%.3f time_ms=%.1f",
+            timing.frame_index, timing.mode or "unknown", timing.refresh_reason or "-",
+            timing.tracked_objects,
+            state.last_tracking_confidence, timing.total_frame_ms,
+        )
 
     def _log_timing(self, label: str, timing: SAM2Timing) -> None:
         if not self.config.debug_timing:
@@ -730,13 +775,29 @@ class SAM2ModelManager:
         tracked_ids = {item.instance_id for item in tracked}
         missing = [replace(item, tracking_state="uncertain") for item in state.instances
                    if item.instance_id not in tracked_ids]
+        mean_confidence = float(np.mean([item.confidence or 0.0 for item in tracked])) if tracked else 0.0
+        state.last_tracking_confidence = mean_confidence
         if missing:
             tracked.extend(missing)
-            self.request_refresh(state.camera_id, "tracking_failure")
-        elif tracked and np.mean([item.confidence or 0.0 for item in tracked]) < 0.5:
-            self.request_refresh(state.camera_id, "low_confidence")
+            failure_reason = "tracking_failure"
+        elif tracked and mean_confidence < 0.5:
+            failure_reason = "low_confidence"
+        else:
+            failure_reason = None
+        if failure_reason is None:
+            state.consecutive_failures = 0
+        else:
+            state.consecutive_failures += 1
+            if state.consecutive_failures >= self.config.refresh_failure_threshold:
+                timing.refresh_requested = self.request_refresh(state.camera_id, failure_reason)
+                if timing.refresh_requested:
+                    logger.info(
+                        "SAM2 FRAME %d: mode=refresh_requested reason=%s failure_count=%d",
+                        frame_index, failure_reason, state.consecutive_failures,
+                    )
         state.instances = sorted(tracked, key=lambda item: item.instance_id)
         state.propagation_count += 1
+        timing.mode = "propagation"
         timing.propagation_number = state.propagation_count
         timing.tracked_objects = len(state.instances)
         self._log_cuda_memory("after propagation")
@@ -753,6 +814,30 @@ class SAM2ModelManager:
             self.refresh_queue.delayed += 1
             return False
         return self.refresh_queue.submit(camera_id, reason)
+
+    def session_metrics(self, camera_id: str) -> dict[str, object]:
+        state = self._get_state(camera_id)
+        elapsed = max(0.001, time.monotonic() - state.session_started)
+        return {
+            "sam2_discovery_runs": state.discovery_count,
+            "sam2_propagation_runs": state.propagation_count,
+            "sam2_periodic_refreshes": state.refresh_counts["periodic"],
+            "sam2_tracking_failure_refreshes": state.refresh_counts["tracking_failure"],
+            "sam2_low_confidence_refreshes": state.refresh_counts["low_confidence"],
+            "sam2_discovery_avg_ms": _mean(state.discovery_timings),
+            "sam2_discovery_latest_ms": state.discovery_timings[-1] if state.discovery_timings else 0.0,
+            "sam2_propagation_avg_ms": _mean(state.propagation_timings),
+            "sam2_propagation_latest_ms": state.propagation_timings[-1] if state.propagation_timings else 0.0,
+            "sam2_frame_avg_ms": _mean(state.frame_timings),
+            "sam2_estimated_fps": len(state.frame_timings) / elapsed,
+            "sam2_current_refresh_reason": state.current_refresh_reason,
+            "sam2_last_refresh_frame_index": state.last_discovery_frame,
+            "sam2_last_refresh_timestamp": state.last_refresh_timestamp,
+            "sam2_tracked_object_count": len(state.instances),
+            "sam2_average_tracking_confidence": state.last_tracking_confidence,
+            "sam2_consecutive_failures": state.consecutive_failures,
+            "sam2_refresh_failure_threshold": self.config.refresh_failure_threshold,
+        }
 
     def stop_camera(self, camera_id: str) -> None:
         with self._states_lock:
@@ -1017,6 +1102,10 @@ def _latency_summary(values: deque[float]) -> dict[str, float | int]:
         "p99_ms": float(np.percentile(data, 99)),
         "fps": 1000.0 / mean if mean > 0 else 0.0,
     }
+
+
+def _mean(values: deque[float]) -> float:
+    return float(np.mean(values)) if values else 0.0
 
 
 def _torch_version_at_least(major: int, minor: int, patch: int) -> bool:

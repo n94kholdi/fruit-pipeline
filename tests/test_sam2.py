@@ -50,6 +50,27 @@ def test_vos_optimization_is_opt_in_even_for_video_service(monkeypatch):
     assert SAM2Config.from_env().vos_optimized is True
 
 
+def test_refresh_stability_settings_use_requested_defaults_and_env_names(monkeypatch):
+    for name in (
+        "SAM2_REFRESH_FRAMES",
+        "SAM2_REFRESH_PROCESSED_FRAMES",
+        "SAM2_MIN_REFRESH_INTERVAL_SECONDS",
+        "SAM2_REFRESH_FAILURE_THRESHOLD",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    config = SAM2Config.from_env()
+    assert config.refresh_processed_frames == 60
+    assert config.min_refresh_interval_seconds == 20.0
+    assert config.refresh_failure_threshold == 5
+
+    monkeypatch.setenv("SAM2_REFRESH_FRAMES", "12")
+    monkeypatch.setenv("SAM2_MIN_REFRESH_INTERVAL_SECONDS", "7")
+    monkeypatch.setenv("SAM2_REFRESH_FAILURE_THRESHOLD", "3")
+    config = SAM2Config.from_env()
+    assert (config.refresh_processed_frames, config.min_refresh_interval_seconds,
+            config.refresh_failure_threshold) == (12, 7.0, 3)
+
+
 def test_torch_version_check_handles_cuda_and_prerelease_suffixes(monkeypatch):
     monkeypatch.setattr(torch, "__version__", "2.5.1+cu118")
     assert _torch_version_at_least(2, 5, 1)
@@ -98,10 +119,12 @@ def test_refresh_phase_is_deterministic_and_spans_interval():
 def test_refresh_queue_is_bounded_prioritized_and_coalesced():
     queue = BoundedRefreshQueue(2)
     assert queue.submit("routine", "scheduled", now=10)
+    assert queue.has("routine")
     assert not queue.submit("routine", "scene_change", now=11)
     assert queue.submit("urgent", "tracking_failure", now=12)
     assert not queue.submit("overflow", "initial", now=13)
     assert queue.pop().camera_id == "urgent"
+    assert not queue.has("urgent")
     assert queue.metrics(now=20) == {
         "depth": 1,
         "oldest_request_age_seconds": 10,

@@ -106,6 +106,7 @@ class FrameResult:
     sizing: SizeEstimationResult
     artifact_dir: str
     full_image_num_fruits: int
+    processing_metrics: dict[str, object] | None = None
 
     @property
     def num_fruits(self) -> int:
@@ -123,6 +124,7 @@ class FrameResult:
             "pallet_type": self.sizing.pallet_detection.pallet_type,
             "pallet_confidence": self.sizing.pallet_detection.confidence,
             "artifact_dir": self.artifact_dir,
+            "processing_metrics": self.processing_metrics or {},
             "fruits": [
                 _fruit_record(instance, measurements.get(instance.instance_id))
                 for instance in self.instances
@@ -260,6 +262,9 @@ class IntegratedFruitSizingPipeline:
         # sam2_video only: reuse a fruit's last measurement across propagated
         # frames instead of remeasuring a mask that has not moved.
         self._sam2_measurement_cache: dict[int, tuple[FruitMeasurement, int]] = {}
+        self._source_frame_count: int | None = None
+        self._total_sampled_frames: int | None = None
+        self._processed_frame_count = 0
 
     def prepare_pallet(self, image_bgr: np.ndarray) -> PalletDetector:
         """Load or collect pallet corners, validate them, and save a preview.
@@ -396,6 +401,8 @@ class IntegratedFruitSizingPipeline:
             )
             if total_sampled_frames is not None and self.config.max_frames is not None:
                 total_sampled_frames = min(total_sampled_frames, self.config.max_frames)
+            self._source_frame_count = raw_frame_count or None
+            self._total_sampled_frames = total_sampled_frames
 
             frame_index = 0
             frame = first_frame
@@ -419,6 +426,7 @@ class IntegratedFruitSizingPipeline:
                         _finite_float_or_none(capture.get(cv2.CAP_PROP_POS_MSEC)),
                         artifact_dir,
                     )
+                    self._processed_frame_count = len(frames) + 1
                     frames.append(frame_result)
                     self._notify_frame(
                         frame_result,
@@ -534,6 +542,7 @@ class IntegratedFruitSizingPipeline:
         artifact_dir: Path,
     ) -> FrameResult:
         artifact_dir.mkdir(parents=True, exist_ok=True)
+        timing = None
         if self.config.inference_mode == "sam2_video":
             image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
             if frame_index is None:
@@ -603,6 +612,7 @@ class IntegratedFruitSizingPipeline:
             sizing=sizing_result,
             artifact_dir=str(artifact_dir),
             full_image_num_fruits=len(full_image_instances),
+            processing_metrics=self._processing_metrics(frame_index, timing),
         )
         result_path = artifact_dir / f"{image_path.stem}_result.json"
         result_path.write_text(json.dumps(frame_result.to_dict(), indent=2) + "\n", encoding="utf-8")
@@ -613,6 +623,30 @@ class IntegratedFruitSizingPipeline:
             len(sizing_result.measurements),
         )
         return frame_result
+
+    def _processing_metrics(self, frame_index: int | None, timing) -> dict[str, object]:
+        processed = self._processed_frame_count + 1
+        source_index = frame_index if frame_index is not None else -1
+        metrics: dict[str, object] = {
+            "total_source_frames": self._source_frame_count,
+            "sampled_frames": self._total_sampled_frames,
+            "processed_frames": processed,
+            "skipped_frames": max(0, source_index + 1 - processed) if frame_index is not None else 0,
+            "current_frame_index": frame_index,
+            "processing_progress_percent": (
+                min(100.0, processed * 100.0 / self._total_sampled_frames)
+                if self._total_sampled_frames else None
+            ),
+        }
+        if timing is not None:
+            metrics.update({
+                "latest_frame_processing_ms": timing.total_frame_ms,
+                "sam2_mode": timing.mode or None,
+                "sam2_refresh_reason": timing.refresh_reason,
+            })
+        if self.sam2_manager is not None and frame_index is not None and hasattr(self.sam2_manager, "session_metrics"):
+            metrics.update(self.sam2_manager.session_metrics(self.config.sizing.camera_id))
+        return metrics
 
     _SAM2_MASK_AREA_CHANGE_THRESHOLD = 0.08
 

@@ -44,6 +44,7 @@ class FruitLiveReporter:
         total_sampled_frames: int | None,
         num_fruits: int,
         num_measured_fruits: int,
+        processing_metrics: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         self.total_fruit_observations += num_fruits
         preview_reference = self._write_preview(frame)
@@ -65,6 +66,7 @@ class FruitLiveReporter:
                 "num_fruits": num_fruits,
                 "num_measured_fruits": num_measured_fruits,
                 "total_fruit_observations": self.total_fruit_observations,
+                **(dict(processing_metrics) if processing_metrics else {}),
             },
         )
 

@@ -201,6 +201,10 @@ class BoundedRefreshQueue:
                     return request
             return None
 
+    def has(self, camera_id: str) -> bool:
+        with self._lock:
+            return camera_id in self._cameras
+
     def metrics(self, now: float | None = None) -> dict[str, float | int]:
         with self._lock:
             current = now or time.monotonic()

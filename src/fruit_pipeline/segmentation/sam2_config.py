@@ -145,9 +145,10 @@ class SAM2Config:
     tensorrt_allow_fallback: bool = True
 
     refresh_seconds: float = 10.0
-    refresh_processed_frames: int = 30
+    refresh_processed_frames: int = 60
     refresh_jitter_seconds: float = 1.0
-    min_refresh_interval_seconds: float = 2.0
+    min_refresh_interval_seconds: float = 20.0
+    refresh_failure_threshold: int = 5
     max_refresh_queue: int = 32
     max_cameras_per_gpu: int = 8
     # Fixed, VRAM-independent sanity ceilings: the number of fruits in a
@@ -209,6 +210,8 @@ class SAM2Config:
         for name in ("match_mask_iou", "match_box_iou"):
             if not 0 <= getattr(self, name) <= 1:
                 raise ValueError(f"{name} must be between 0 and 1")
+        if self.refresh_failure_threshold < 1:
+            raise ValueError("refresh_failure_threshold must be >= 1")
 
     @property
     def variant(self) -> SAM2Variant:
@@ -254,9 +257,13 @@ class SAM2Config:
             tensorrt_workspace_bytes=_env_int("SAM2_TENSORRT_WORKSPACE_BYTES", 4 * 1024**3, 1),
             tensorrt_allow_fallback=env_flag("SAM2_TENSORRT_ALLOW_FALLBACK", True),
             refresh_seconds=_env_float("SAM2_REFRESH_SECONDS", 10.0),
-            refresh_processed_frames=_env_int("SAM2_REFRESH_PROCESSED_FRAMES", 30),
+            refresh_processed_frames=_env_int(
+                "SAM2_REFRESH_FRAMES",
+                _env_int("SAM2_REFRESH_PROCESSED_FRAMES", 60),
+            ),
             refresh_jitter_seconds=_env_float("SAM2_REFRESH_JITTER_SECONDS", 1.0),
-            min_refresh_interval_seconds=_env_float("SAM2_MIN_REFRESH_INTERVAL_SECONDS", 2.0),
+            min_refresh_interval_seconds=_env_float("SAM2_MIN_REFRESH_INTERVAL_SECONDS", 20.0),
+            refresh_failure_threshold=_env_int("SAM2_REFRESH_FAILURE_THRESHOLD", 5, 1),
             max_refresh_queue=_env_int("SAM2_MAX_REFRESH_QUEUE", 32, 1),
             max_cameras_per_gpu=_env_int_or_auto(
                 "SAM2_MAX_CAMERAS_PER_GPU", auto_capacity["max_cameras_per_gpu"], 1

@@ -221,6 +221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             total_sampled_frames=total_count,
             num_fruits=frame_result.num_fruits,
             num_measured_fruits=len(frame_result.sizing.measurements),
+            processing_metrics=frame_result.processing_metrics,
         )
 
     result = IntegratedFruitSizingPipeline(
