@@ -62,6 +62,25 @@ def parser() -> argparse.ArgumentParser:
              "and VRAM over time.",
     )
     result.add_argument("--refresh-processed-frames", type=int, default=30)
+    result.add_argument(
+        "--warmup-propagations", type=int, default=1,
+        help="Exclude this many initial propagation calls from the steady-state summary.",
+    )
+    result.add_argument(
+        "--video-matrix", action="store_true",
+        help="Run realistic benchmarks for VOS optimization off/on and CPU-state "
+             "offload on/off. The GPU-resident-state cases may OOM on small cards.",
+    )
+    result.add_argument(
+        "--model-sweep", action="store_true",
+        help="Discover once with Base+, then propagate the exact same masks with "
+             "SAM2.1 Tiny, Small, and Base+ (all checkpoints must be available).",
+    )
+    result.add_argument(
+        "--implementation-label", default="new-predictor",
+        help="Label embedded in output (use old-commit/new-unoptimized/new-optimized "
+             "when comparing separately built container images).",
+    )
     return result
 
 
@@ -255,8 +274,26 @@ def sweep_tracking_batch_size(base: SAM2Config, video: str, frame_step: int, lim
     return rows
 
 
+def _timing_row(timing) -> dict[str, float | int]:
+    return {
+        "objects": timing.tracked_objects,
+        "propagation_number": timing.propagation_number,
+        "feature_encoding_ms": timing.frame_feature_encoding_ms,
+        "sam2_propagation_ms": timing.sam2_propagation_ms,
+        "mask_postprocessing_ms": timing.mask_postprocessing_ms,
+        "mask_transfer_ms": timing.mask_transfer_ms,
+        "bbox_extraction_ms": timing.bbox_extraction_ms,
+        "propagation_total_ms": timing.propagation_ms,
+        "frame_total_ms": timing.total_frame_ms,
+        "cuda_allocated_mb": timing.cuda_allocated_mb,
+        "cuda_reserved_mb": timing.cuda_reserved_mb,
+        "cuda_peak_mb": timing.cuda_peak_mb,
+    }
+
+
 def run_realistic_benchmark(base: SAM2Config, video: str, frame_step: int, limit: int,
-                            refresh_processed_frames: int) -> dict[str, object]:
+                            refresh_processed_frames: int, warmup_propagations: int = 1,
+                            implementation_label: str = "new-predictor") -> dict[str, object]:
     """Discovery every ``refresh_processed_frames`` processed frames, over a
     long run. Reports the numbers the acceptance criteria actually care
     about: discovery latency, average propagation latency, average FPS over
@@ -267,13 +304,24 @@ def run_realistic_benchmark(base: SAM2Config, video: str, frame_step: int, limit
                      debug_memory=True, debug_timing=True)
     manager = SAM2ModelManager(config)
     _reset_peak_vram(manager.device)
+    startup_started = time.perf_counter()
+    manager.load()
+    model_startup_ms = (time.perf_counter() - startup_started) * 1000
     capture = cv2.VideoCapture(video)
+    decode_started = time.perf_counter()
     ok, first = capture.read()
+    decode_ms = [(time.perf_counter() - decode_started) * 1000]
     if not ok:
         raise ValueError(f"Cannot read {video}")
+    predictor_started = time.perf_counter()
     manager.start_camera("realistic", video, first.shape[:2])
-    discovery, propagation, end_to_end = [], [], []
+    predictor_init_ms = (time.perf_counter() - predictor_started) * 1000
+    discovery, registration, propagation, end_to_end = [], [], [], []
+    feature_encoding, sam2_propagation = [], []
+    mask_postprocessing, mask_transfer, bbox_extraction = [], [], []
+    propagation_rows = []
     discovered_counts, tracked_counts = [], []
+    uncertain_counts = []
     vram_over_time = []  # (processed_frame_number, allocated_mb, reserved_mb)
     index = processed = 0
     frame = first
@@ -287,10 +335,20 @@ def run_realistic_benchmark(base: SAM2Config, video: str, frame_step: int, limit
                 end_to_end.append((time.perf_counter() - started) * 1000)
                 if timing.discovery_ms:
                     discovery.append(timing.discovery_ms)
+                    registration.append(timing.registration_ms)
                     discovered_counts.append(len(instances))
                 if timing.propagation_ms:
                     propagation.append(timing.propagation_ms)
+                    feature_encoding.append(timing.frame_feature_encoding_ms)
+                    sam2_propagation.append(timing.sam2_propagation_ms)
+                    mask_postprocessing.append(timing.mask_postprocessing_ms)
+                    mask_transfer.append(timing.mask_transfer_ms)
+                    bbox_extraction.append(timing.bbox_extraction_ms)
+                    propagation_rows.append(_timing_row(timing))
                     tracked_counts.append(len(instances))
+                    uncertain_counts.append(sum(
+                        item.tracking_state == "uncertain" for item in instances
+                    ))
                 device = manager.device
                 if device.type == "cuda" and torch.cuda.is_available():
                     vram_over_time.append((
@@ -299,28 +357,182 @@ def run_realistic_benchmark(base: SAM2Config, video: str, frame_step: int, limit
                         round(torch.cuda.memory_reserved(device) / 1024**2, 1),
                     ))
                 processed += 1
+            decode_started = time.perf_counter()
             ok, frame = capture.read()
+            decode_ms.append((time.perf_counter() - decode_started) * 1000)
             index += 1
     finally:
         capture.release()
         manager.stop_camera("realistic")
     mean_end_to_end = statistics.fmean(end_to_end) if end_to_end else 0.0
+    warmup = propagation_rows[:warmup_propagations]
+    steady_propagation = propagation[warmup_propagations:]
     return {
+        "implementation": implementation_label,
+        "model": config.model_name,
+        "vos_optimized": config.vos_optimized,
+        "offload_video_to_cpu": config.offload_video_to_cpu,
+        "offload_state_to_cpu": config.offload_state_to_cpu,
         "processed_frames": processed,
         "refresh_processed_frames": refresh_processed_frames,
+        "model_startup_ms": round(model_startup_ms, 1),
+        "predictor_init_ms": round(predictor_init_ms, 1),
+        "video_decode": summarize(decode_ms),
         "discovery": summarize(discovery),
-        "propagation": summarize(propagation),
+        "registration": summarize(registration),
+        "first_or_warmup_propagations": warmup,
+        "steady_state_propagation": summarize(steady_propagation),
+        "all_propagation": summarize(propagation),
+        "stage_timings": {
+            "frame_feature_encoding": summarize(feature_encoding[warmup_propagations:]),
+            # Includes SAM2's internal state prefetch/offload operations. The
+            # on/off matrix quantifies their incremental cost without fragile
+            # monkey-patching of Tensor.to inside upstream SAM2.
+            "sam2_propagation_including_state_transfer": summarize(
+                sam2_propagation[warmup_propagations:]
+            ),
+            "mask_postprocessing": summarize(mask_postprocessing[warmup_propagations:]),
+            "mask_gpu_to_cpu_transfer": summarize(mask_transfer[warmup_propagations:]),
+            "bbox_extraction": summarize(bbox_extraction[warmup_propagations:]),
+        },
         "average_fps_over_sequence": 1000 / mean_end_to_end if mean_end_to_end else 0.0,
         "mean_discovered_fruit_count": statistics.fmean(discovered_counts) if discovered_counts else 0,
         "mean_tracked_fruit_count": statistics.fmean(tracked_counts) if tracked_counts else 0,
+        "crowded_target_200_to_400_met": bool(
+            discovered_counts and 200 <= statistics.fmean(discovered_counts) <= 400
+        ),
+        "mean_uncertain_object_count": statistics.fmean(uncertain_counts) if uncertain_counts else 0,
         "peak_vram_mb": round(_peak_vram_mb(manager.device), 1),
         "vram_over_time": vram_over_time,
+    }
+
+
+def run_video_matrix(base: SAM2Config, args) -> list[dict[str, object]]:
+    rows = []
+    for optimized, offload_state in ((False, True), (True, True), (False, False), (True, False)):
+        config = replace(base, vos_optimized=optimized, offload_state_to_cpu=offload_state)
+        label = f"new-v2-optimized={int(optimized)}-state_offload={int(offload_state)}"
+        try:
+            rows.append(run_realistic_benchmark(
+                config, args.video, args.frame_step, args.max_processed_frames,
+                args.refresh_processed_frames, args.warmup_propagations, label,
+            ))
+        except torch.cuda.OutOfMemoryError as exc:
+            rows.append({
+                "implementation": label,
+                "error": "CUDA out of memory",
+                "detail": str(exc),
+            })
+            torch.cuda.empty_cache()
+    return rows
+
+
+def run_model_sweep(base: SAM2Config, args) -> dict[str, object]:
+    """Compare tracker sizes using one shared Base+ discovery result.
+
+    This intentionally disables rediscovery: otherwise each model could start
+    from a different set of objects and propagation latency/retention would no
+    longer be comparable.
+    """
+    capture = cv2.VideoCapture(args.video)
+    ok, first = capture.read()
+    capture.release()
+    if not ok:
+        raise ValueError(f"Cannot read {args.video}")
+    first_rgb = cv2.cvtColor(first, cv2.COLOR_BGR2RGB)
+    discovery_config = replace(
+        base, model_name="sam2.1_hiera_base_plus", checkpoint=None,
+        config_file=None, vos_optimized=False,
+    )
+    discovery_manager = SAM2ModelManager(discovery_config)
+    seed_instances, discovery_timing = discovery_manager.discover_image(first_rgb)
+    seed_count = len(seed_instances)
+    discovery_manager.unload()
+
+    results = []
+    for model_name in (
+        "sam2.1_hiera_tiny", "sam2.1_hiera_small", "sam2.1_hiera_base_plus",
+    ):
+        config = replace(
+            base, model_name=model_name, checkpoint=None, config_file=None,
+            refresh_seconds=0, refresh_processed_frames=0,
+            debug_memory=True, debug_timing=True,
+        )
+        manager = SAM2ModelManager(config)
+        _reset_peak_vram(manager.device)
+        capture = cv2.VideoCapture(args.video)
+        ok, _first = capture.read()
+        if not ok:
+            raise ValueError(f"Cannot read {args.video}")
+        camera_id = f"model-sweep-{model_name}"
+        state = manager.start_camera(camera_id, args.video, first.shape[:2])
+        state.instances = [replace(item) for item in seed_instances]
+        with torch.inference_mode(), manager._autocast():
+            registration_ms = manager._register_instances(state, 0)
+        state.last_discovery = time.monotonic()
+        state.processed_frames = 1
+        propagation = []
+        sam2_only = []
+        retained = []
+        uncertain = []
+        index = 1
+        processed = 0
+        try:
+            while processed < args.max_processed_frames:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if index % args.frame_step == 0:
+                    instances, timing = manager.process_frame(
+                        camera_id, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), index,
+                    )
+                    propagation.append(timing.propagation_ms)
+                    sam2_only.append(timing.sam2_propagation_ms)
+                    uncertain.append(sum(
+                        item.tracking_state == "uncertain" for item in instances
+                    ))
+                    retained.append(sum(
+                        item.tracking_state != "uncertain" for item in instances
+                    ))
+                    processed += 1
+                index += 1
+        finally:
+            capture.release()
+            manager.stop_camera(camera_id)
+        warmup = args.warmup_propagations
+        results.append({
+            "model": model_name,
+            "vos_optimized": config.vos_optimized,
+            "seed_object_count": seed_count,
+            "registration_ms": round(registration_ms, 1),
+            "first_or_warmup_propagation_ms": propagation[:warmup],
+            "steady_state_propagation": summarize(propagation[warmup:]),
+            "steady_state_sam2_only": summarize(sam2_only[warmup:]),
+            "mean_retained_objects": statistics.fmean(retained) if retained else 0,
+            "mean_uncertain_objects": statistics.fmean(uncertain) if uncertain else 0,
+            "peak_vram_mb": round(_peak_vram_mb(manager.device), 1),
+        })
+    return {
+        "shared_discovery_model": "sam2.1_hiera_base_plus",
+        "shared_discovery_ms": round(discovery_timing.discovery_ms, 1),
+        "shared_seed_object_count": seed_count,
+        "results": results,
     }
 
 
 def main() -> int:
     args = parser().parse_args()
     base = SAM2Config.from_env()
+    if args.model_sweep:
+        report = run_model_sweep(base, args)
+        Path(args.output).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report, indent=2))
+        return 0
+    if args.video_matrix:
+        report = run_video_matrix(base, args)
+        Path(args.output).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report, indent=2))
+        return 0
     if args.memory_trace:
         run_memory_trace(base, args.video, args.frame_step, args.max_processed_frames)
         return 0
@@ -339,8 +551,10 @@ def main() -> int:
     if args.realistic:
         report = run_realistic_benchmark(
             base, args.video, args.frame_step, args.max_processed_frames,
-            args.refresh_processed_frames,
+            args.refresh_processed_frames, args.warmup_propagations,
+            args.implementation_label,
         )
+        Path(args.output).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(report, indent=2))
         return 0
     scenarios = [

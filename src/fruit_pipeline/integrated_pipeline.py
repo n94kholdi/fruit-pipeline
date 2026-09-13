@@ -555,8 +555,13 @@ class IntegratedFruitSizingPipeline:
                     self.config.sizing.camera_id, image_rgb, frame_index,
                 )
                 logger.info(
-                    "SAM2 frame %s: discovery=%.1fms propagation=%.1fms",
-                    frame_index, timing.discovery_ms, timing.propagation_ms,
+                    "SAM2 frame %s: objects=%d discovery=%.1fms "
+                    "propagation=%.1fms total=%.1fms cuda_allocated=%.1fMB "
+                    "cuda_reserved=%.1fMB cuda_peak=%.1fMB",
+                    frame_index, len(full_image_instances), timing.discovery_ms,
+                    timing.propagation_ms, timing.total_frame_ms,
+                    timing.cuda_allocated_mb, timing.cuda_reserved_mb,
+                    timing.cuda_peak_mb,
                 )
         else:
             detection_config = replace(

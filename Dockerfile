@@ -15,7 +15,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FRUIT_PIPELINE_SAM2_MODEL=sam2.1_hiera_large \
     SAM2_PRECISION=bf16 \
     SAM2_RUNTIME=pytorch \
-    SAM2_VOS_OPTIMIZED=false \
     SAM2_BUILD_CUDA=0 \
     YOLO_CONFIG_DIR=/app/output/.config/Ultralytics
 
@@ -30,8 +29,8 @@ RUN apt-get update \
 # build env and pulling a second, PyPI/CUDA-12 copy of torch (plus its nvidia-*
 # wheels) into this layer -- the ~3 GB duplicate that bloated the image. The
 # slim base has no nvcc, so SAM2_BUILD_CUDA=0 skips the CUDA extension cleanly
-# (runtime uses SAM2_VOS_OPTIMIZED=false and does not need it).
-ARG SAM2_REF=c2ec8e14a185632b0a5d8b161928ceb50197eddc
+# (the extension is optional for both ordinary and compiled VOS inference).
+ARG SAM2_REF=2b90b9f5ceec907a1c18123530e92e794ad901a4
 RUN python -m pip install --no-cache-dir --no-build-isolation \
         "SAM-2 @ git+https://github.com/facebookresearch/sam2.git@${SAM2_REF}"
 

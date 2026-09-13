@@ -49,6 +49,7 @@ SAM2_VARIANTS: dict[str, SAM2Variant] = {
 SAM2_MODEL_NAMES = tuple(SAM2_VARIANTS)
 SAM2_PRECISIONS = ("bf16", "fp16", "fp32")
 SAM2_RUNTIMES = ("pytorch", "hybrid", "tensorrt")
+SAM2_UPSTREAM_REF = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -235,6 +236,10 @@ class SAM2Config:
     @classmethod
     def from_env(cls) -> "SAM2Config":
         model = os.getenv("FRUIT_PIPELINE_SAM2_MODEL", "sam2.1_hiera_base_plus")
+        # Full-model compilation is a video optimization and can introduce
+        # small numerical differences. Enable it by default only for the
+        # video service; image/detector mode keeps its established path.
+        video_mode = os.getenv("FRUIT_PIPELINE_INFERENCE_MODE", "detector") == "sam2_video"
         auto_capacity = _auto_capacity_defaults()
         return cls(
             model_name=model,
@@ -242,7 +247,7 @@ class SAM2Config:
             config_file=os.getenv("FRUIT_PIPELINE_SAM2_CONFIG") or None,
             device=os.getenv("FRUIT_PIPELINE_DEVICE", "cuda"),
             precision=os.getenv("SAM2_PRECISION", "bf16").lower(),
-            vos_optimized=env_flag("SAM2_VOS_OPTIMIZED", False),
+            vos_optimized=env_flag("SAM2_VOS_OPTIMIZED", video_mode),
             runtime=os.getenv("SAM2_RUNTIME", "pytorch").lower(),
             tensorrt_engine_dir=os.getenv("SAM2_TENSORRT_ENGINE_DIR", "/models/tensorrt"),
             tensorrt_precision=os.getenv("SAM2_TENSORRT_PRECISION", "fp16").lower(),

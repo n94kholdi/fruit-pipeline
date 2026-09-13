@@ -124,8 +124,14 @@ rejects a job whose `inference_mode` differs from the worker's startup mode.
 
 Precision is selected with `SAM2_PRECISION=bf16|fp16|fp32`. BF16 is the initial
 default and fails clearly on unsupported GPUs; choose FP16 or the validated
-FP32 fallback there. `SAM2_VOS_OPTIMIZED=true` enables SAM2's compiled VOS
-predictor. The first compiled run can take substantially longer.
+FP32 fallback there. The SAM2 dependency is pinned to upstream commit
+`2b90b9f5ceec907a1c18123530e92e794ad901a4` (Dec 16, 2024), which includes
+the independent-per-object predictor, full VOS compilation, and the fix for
+CPU-offloaded tracking state. `SAM2_VOS_OPTIMIZED=true|false` explicitly
+controls full-model compilation. When unset it defaults on only for a
+`sam2_video` service, leaving detector/image inference uncompiled. Full VOS
+compilation requires PyTorch 2.5.1 or newer and the first propagation can take
+substantially longer while kernels compile.
 
 Refresh defaults are ten seconds or 30 **processed** frames, whichever becomes
 due first. Thirty source frames at 30 FPS is one second; 30 processed frames at
@@ -137,16 +143,12 @@ due first. Thirty source frames at 30 FPS is one second; 30 processed frames at
 the selected model, actual precision/runtime, compilation state, load time,
 VRAM, active state, discovery settings, and refresh queue counters.
 
-Of those, `SAM2_MAX_CAMERAS_PER_GPU`, `SAM2_MAX_ACTIVE_OBJECTS_PER_CAMERA`,
-`SAM2_MAX_TOTAL_ACTIVE_OBJECTS`, and `SAM2_MAX_FRAME_HISTORY` are, by default,
-**auto-sized from the resident GPU's detected VRAM** (see
-`sam2_config._auto_capacity_defaults`) instead of using a single fixed value —
-video mode keeps a per-object memory-bank resident on GPU for the whole frame
-history, so a ceiling sized for a large card can fragment/OOM a small one
-well before the ceiling itself is reached. Leave all four unset to get sizing
-appropriate to whatever GPU the container actually has; set any of them
-explicitly (env var, or via `docker-compose.production.yml`'s `env_file`) to
-pin a specific ceiling instead.
+Of those, camera concurrency, tracking registration batch size, and frame
+history are auto-sized from detected VRAM. Fruit-count ceilings are fixed,
+generous sanity limits and never truncate discovery based on GPU size.
+`SAM2_OFFLOAD_VIDEO_TO_CPU=true` and `SAM2_OFFLOAD_STATE_TO_CPU=true` are the
+safe low-VRAM defaults; benchmark state offload disabled only where peak VRAM
+remains bounded and comfortably below the device limit.
 
 `SAM2_RUNTIME=pytorch` is the required baseline. `hybrid` and `tensorrt` are
 experimental and require an offline-built, checksum/config/GPU-compatible
@@ -178,6 +180,30 @@ count, runtime, and VRAM. Add labeled ground truth when comparing discovery
 recall, mask/boundary IoU, sizing error, and ID switches. Do not infer camera
 capacity from model-only FPS; stop increasing concurrency when the production
 latency/FPS objective fails.
+
+For a 100–300 processed-frame crowded-video run with discovery every 30
+processed frames, use:
+
+```bash
+python scripts/benchmark_sam2.py crowded.mp4 --realistic \
+  --max-processed-frames 300 --refresh-processed-frames 30 \
+  --warmup-propagations 1 --output realistic.json
+```
+
+The report separates model/predictor startup, the first compile/warmup
+propagation, steady-state propagation, frame encoding, SAM2 inference (including
+its internal state transfers), mask postprocessing, GPU-to-CPU mask transfer,
+bbox extraction, decoding, registration, total-frame latency, object retention,
+and CUDA memory over time. To compare optimized/unoptimized VOS and state
+offload on/off, add `--video-matrix`. GPU-resident state cases are recorded as
+OOM instead of being selected automatically. Use `--model-sweep` to discover
+once with Base+ and propagate those exact masks with Tiny, Small, and Base+.
+
+An old-vs-new dependency comparison requires separate container builds because
+one Python process cannot load two versions of the `sam2` package. Run the same
+command in each image with `--implementation-label old-commit` and
+`--implementation-label new-optimized`; do not compare the compiled warmup row
+against the old predictor's steady-state summary.
 
 ## Run
 

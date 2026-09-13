@@ -7,7 +7,11 @@ import torch
 from fruit_pipeline.segmentation import sam2_config as sam2_config_module
 from fruit_pipeline.segmentation.sam import FruitInstance
 from fruit_pipeline.segmentation.sam2_config import SAM2Config, SAM2_MODEL_NAMES
-from fruit_pipeline.segmentation.sam2_manager import SAM2ModelManager
+from fruit_pipeline.segmentation.sam2_manager import (
+    SAM2ModelManager,
+    _mask_boxes,
+    _torch_version_at_least,
+)
 from fruit_pipeline.segmentation.sam2_tracking import (
     BoundedRefreshQueue,
     InstanceReconciler,
@@ -32,6 +36,36 @@ def test_all_sam21_variants_are_available_and_base_plus_is_default():
     assert config.model_name == "sam2.1_hiera_base_plus"
     assert config.resolved_checkpoint.endswith("sam2.1_hiera_base_plus.pt")
     assert config.resolved_config.endswith("sam2.1_hiera_b+.yaml")
+
+
+def test_vos_optimization_defaults_only_for_video_service(monkeypatch):
+    monkeypatch.setenv("FRUIT_PIPELINE_INFERENCE_MODE", "sam2_video")
+    monkeypatch.delenv("SAM2_VOS_OPTIMIZED", raising=False)
+    assert SAM2Config.from_env().vos_optimized is True
+
+    monkeypatch.setenv("FRUIT_PIPELINE_INFERENCE_MODE", "detector")
+    assert SAM2Config.from_env().vos_optimized is False
+
+    monkeypatch.setenv("SAM2_VOS_OPTIMIZED", "1")
+    assert SAM2Config.from_env().vos_optimized is True
+
+
+def test_torch_version_check_handles_cuda_and_prerelease_suffixes(monkeypatch):
+    monkeypatch.setattr(torch, "__version__", "2.5.1+cu118")
+    assert _torch_version_at_least(2, 5, 1)
+    monkeypatch.setattr(torch, "__version__", "2.5.0")
+    assert not _torch_version_at_least(2, 5, 1)
+
+
+def test_vectorized_mask_boxes_handles_multiple_and_empty_masks():
+    masks = np.zeros((3, 10, 12), dtype=bool)
+    masks[0, 2:5, 3:8] = True
+    masks[1, 0:10, 0:12] = True
+    assert _mask_boxes(masks) == [
+        [3.0, 2.0, 8.0, 5.0],
+        [0.0, 0.0, 12.0, 10.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ]
 
 
 def test_unknown_variant_is_rejected():
@@ -131,6 +165,12 @@ def test_first_frame_discovers_then_intermediate_frame_propagates_with_roi_coord
     assert tracked[0].instance_id == discovered[0].instance_id == 1
     assert first_timing.discovery_ms > 0
     assert second_timing.propagation_ms > 0
+    assert second_timing.sam2_propagation_ms > 0
+    assert second_timing.mask_postprocessing_ms > 0
+    assert second_timing.bbox_extraction_ms > 0
+    assert second_timing.total_frame_ms >= second_timing.propagation_ms
+    assert second_timing.tracked_objects == 1
+    assert second_timing.propagation_number == 1
     manager.stop_camera("cam")
     assert predictor.reset is True
 
@@ -464,6 +504,28 @@ def test_periodic_refresh_releases_old_state_but_preserves_instance_ids():
     assert predictor.init_state_calls[-1] == {
         "offload_video_to_cpu": True, "offload_state_to_cpu": True,
     }
+
+
+def test_refresh_at_history_boundary_resets_and_registers_only_once():
+    predictor = _DynamicFakePredictor(frame_shape=(50, 60))
+    manager = SAM2ModelManager(
+        SAM2Config(
+            device="cpu", refresh_seconds=0, refresh_processed_frames=2,
+            min_mask_region_area=1, max_frame_history=2,
+        ),
+        predictor=predictor,
+        generator=_FakeGenerator(),
+    )
+    image = np.zeros((50, 60, 3), dtype=np.uint8)
+    manager.start_camera("cam", "video.mp4", (50, 60), initial_frame_rgb=image)
+
+    manager.process_frame("cam", image, 0)
+    resets_before_refresh = predictor.reset_state_calls
+    registrations_before_refresh = len(predictor.add_new_mask_calls)
+    manager.process_frame("cam", image, 1)
+
+    assert predictor.reset_state_calls == resets_before_refresh + 1
+    assert len(predictor.add_new_mask_calls) == registrations_before_refresh + 1
 
 
 def test_discovery_defaults_are_balanced_not_expensive():

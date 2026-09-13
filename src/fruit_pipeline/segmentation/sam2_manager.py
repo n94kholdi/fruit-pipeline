@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ import numpy as np
 import torch
 
 from fruit_pipeline.segmentation.sam import FruitInstance, filter_masks
-from fruit_pipeline.segmentation.sam2_config import SAM2Config
+from fruit_pipeline.segmentation.sam2_config import SAM2Config, SAM2_UPSTREAM_REF
 from fruit_pipeline.segmentation.sam2_tracking import (
     BoundedRefreshQueue,
     InstanceReconciler,
@@ -37,6 +38,7 @@ logger = logging.getLogger(__name__)
 class SAM2Timing:
     discovery_ms: float = 0.0
     propagation_ms: float = 0.0
+    total_frame_ms: float = 0.0
     queue_wait_ms: float = 0.0
     # Sub-stage breakdown of discovery_ms / a frame-history reset, populated
     # only when the corresponding stage actually runs this call. Meant for
@@ -46,7 +48,17 @@ class SAM2Timing:
     filtering_ms: float = 0.0
     predictor_init_ms: float = 0.0
     registration_ms: float = 0.0
+    frame_feature_encoding_ms: float = 0.0
+    sam2_propagation_ms: float = 0.0
+    mask_postprocessing_ms: float = 0.0
+    mask_transfer_ms: float = 0.0
+    bbox_extraction_ms: float = 0.0
     state_reset_ms: float = 0.0
+    tracked_objects: int = 0
+    propagation_number: int = 0
+    cuda_allocated_mb: float = 0.0
+    cuda_reserved_mb: float = 0.0
+    cuda_peak_mb: float = 0.0
 
 
 @dataclass
@@ -66,6 +78,7 @@ class CameraVideoState:
     next_refresh_due: float = 0.0
     dynamic_frames: bool = False
     predictor_frame_index: int = 0
+    propagation_count: int = 0
     lifecycle_events: list[dict[str, object]] = field(default_factory=list)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -124,6 +137,11 @@ class SAM2ModelManager:
                 from sam2 import _C  # noqa: F401
             except ImportError as exc:
                 raise RuntimeError("SAM2 CUDA extension is required but unavailable") from exc
+        if self.config.vos_optimized and not _torch_version_at_least(2, 5, 1):
+            raise RuntimeError(
+                "SAM2_VOS_OPTIMIZED requires PyTorch >= 2.5.1; "
+                f"found {torch.__version__}"
+            )
 
     def _configure_runtime(self) -> None:
         if self.config.runtime == "pytorch":
@@ -173,6 +191,14 @@ class SAM2ModelManager:
             self._configure_runtime()
             from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
             from sam2.build_sam import build_sam2_video_predictor
+
+            if self.config.vos_optimized and "vos_optimized" not in inspect.signature(
+                build_sam2_video_predictor
+            ).parameters:
+                raise RuntimeError(
+                    "Installed SAM-2 does not support vos_optimized. Rebuild with "
+                    f"the pinned commit {SAM2_UPSTREAM_REF}."
+                )
 
             started = time.perf_counter()
             predictor = build_sam2_video_predictor(
@@ -324,9 +350,9 @@ class SAM2ModelManager:
         """
         state = self._get_state(camera_id)
         timing = SAM2Timing()
+        frame_started = time.perf_counter()
         with state.lock, torch.inference_mode(), self._autocast():
             self._validate_state_frame(state, image_rgb)
-            predictor_frame_index = self._prepare_dynamic_frame(state, image_rgb, frame_index, timing)
             state.processed_frames += 1
             now = time.monotonic()
             due_time = state.last_discovery == 0 or (
@@ -343,11 +369,22 @@ class SAM2ModelManager:
                 if request is None:
                     if not state.instances:
                         raise RuntimeError("Initial SAM2 discovery was rejected by the bounded refresh queue")
+                    predictor_frame_index = self._prepare_dynamic_frame(
+                        state, image_rgb, frame_index, timing,
+                    )
                     instances = self._propagate(state, frame_index, predictor_frame_index, timing)
                     self._latencies["propagation"].append(timing.propagation_ms)
-                    self._log_timing(camera_id, timing)
+                    self._finalize_frame_timing(camera_id, timing, frame_started)
                     return instances, timing
                 timing.queue_wait_ms = max(0.0, (time.monotonic() - request.requested_at) * 1000)
+                # A live/dynamic refresh creates a fresh one-frame state from
+                # image_rgb inside _discover. Do not first append this frame
+                # to the state that is about to be discarded; when history and
+                # refresh boundaries coincide that would otherwise reset and
+                # register hundreds of objects twice.
+                predictor_frame_index = (
+                    state.predictor_frame_index if state.dynamic_frames else frame_index
+                )
                 instances = self._discover(state, image_rgb, frame_index, predictor_frame_index, timing)
                 self._latencies["discovery"].append(timing.discovery_ms)
                 state.last_discovery = now
@@ -356,13 +393,27 @@ class SAM2ModelManager:
                     camera_id, now + 1e-6, self.config.refresh_seconds,
                     self.config.refresh_jitter_seconds,
                 )
-                self._log_timing(camera_id, timing)
+                timing.tracked_objects = len(instances)
+                self._finalize_frame_timing(camera_id, timing, frame_started)
                 return instances, timing
+            predictor_frame_index = self._prepare_dynamic_frame(
+                state, image_rgb, frame_index, timing,
+            )
             instances = self._propagate(state, frame_index, predictor_frame_index, timing)
             self._latencies["propagation"].append(timing.propagation_ms)
             state.last_activity = now
-            self._log_timing(camera_id, timing)
+            self._finalize_frame_timing(camera_id, timing, frame_started)
             return instances, timing
+
+    def _finalize_frame_timing(
+        self, camera_id: str, timing: SAM2Timing, frame_started: float,
+    ) -> None:
+        timing.total_frame_ms = (time.perf_counter() - frame_started) * 1000
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            timing.cuda_allocated_mb = torch.cuda.memory_allocated(self.device) / 1024**2
+            timing.cuda_reserved_mb = torch.cuda.memory_reserved(self.device) / 1024**2
+            timing.cuda_peak_mb = torch.cuda.max_memory_allocated(self.device) / 1024**2
+        self._log_timing(camera_id, timing)
 
     def _log_timing(self, label: str, timing: SAM2Timing) -> None:
         if not self.config.debug_timing:
@@ -370,11 +421,19 @@ class SAM2ModelManager:
         logger.info(
             "SAM2 timing [%s]: preprocessing=%.1fms mask_generation=%.1fms "
             "filtering=%.1fms predictor_init=%.1fms registration=%.1fms "
-            "propagation=%.1fms state_reset=%.1fms queue_wait=%.1fms total_discovery=%.1fms",
+            "feature_encoding=%.1fms sam2_propagation=%.1fms mask_postprocess=%.1fms "
+            "mask_transfer=%.1fms bbox=%.1fms propagation_total=%.1fms "
+            "state_reset=%.1fms queue_wait=%.1fms discovery_total=%.1fms "
+            "frame_total=%.1fms objects=%d propagation_number=%d "
+            "cuda_allocated=%.1fMB cuda_reserved=%.1fMB cuda_peak=%.1fMB",
             label, timing.preprocessing_ms, timing.mask_generation_ms,
             timing.filtering_ms, timing.predictor_init_ms, timing.registration_ms,
-            timing.propagation_ms, timing.state_reset_ms, timing.queue_wait_ms,
-            timing.discovery_ms,
+            timing.frame_feature_encoding_ms, timing.sam2_propagation_ms,
+            timing.mask_postprocessing_ms, timing.mask_transfer_ms,
+            timing.bbox_extraction_ms, timing.propagation_ms,
+            timing.state_reset_ms, timing.queue_wait_ms, timing.discovery_ms,
+            timing.total_frame_ms, timing.tracked_objects, timing.propagation_number,
+            timing.cuda_allocated_mb, timing.cuda_reserved_mb, timing.cuda_peak_mb,
         )
 
     def _run_discovery(self, image_rgb: np.ndarray, crop_box: tuple[int, int, int, int] | None,
@@ -471,15 +530,29 @@ class SAM2ModelManager:
                 len(state.instances), self.config.tracking_object_batch_size,
             )
         if state.dynamic_frames:
-            # Always start tracking from a fresh SAM2 state at every discovery
-            # boundary instead of carrying an ever-growing video state through
-            # the whole stream: only application-level instances/IDs survive,
-            # the previous inference_state (and any CUDA tensors it held) is
-            # dropped and can be reclaimed by the allocator.
-            self._reset_tracking_state(state, image_rgb, timing)
+            initial_state_already_matches = (
+                state.last_discovery_frame < 0
+                and state.processed_frames == 1
+                and state.predictor_frame_index == 0
+            )
+            if initial_state_already_matches:
+                # start_camera(initial_frame_rgb=...) already initialized this
+                # exact frame. Register directly instead of decoding/staging it
+                # and initializing an identical state a second time.
+                timing.registration_ms += self._register_instances(state, 0)
+            else:
+                # Start tracking from a fresh state at later discovery
+                # boundaries. Only application-level instances/IDs survive,
+                # bounding the model's per-frame/per-object memory bank.
+                self._reset_tracking_state(state, image_rgb, timing)
         else:
             introduces_new_object = any(event.event == "discovered" for event in reconciled.events)
-            if introduces_new_object and state.inference_state.get("tracking_has_started"):
+            is_independent_object_predictor = "output_dict_per_obj" in state.inference_state
+            if (
+                introduces_new_object
+                and state.inference_state.get("tracking_has_started")
+                and not is_independent_object_predictor
+            ):
                 # SAM2's video predictor only allows registering object ids
                 # before the first propagate call ("Cannot add new object id
                 # ... after tracking starts"). reset_state() clears only that
@@ -591,6 +664,18 @@ class SAM2ModelManager:
                    predictor_frame_index: int, timing: SAM2Timing) -> list[FruitInstance]:
         started = time.perf_counter()
         self._log_cuda_memory("before propagation")
+        # Explicitly encode once before per-object tracking. The official
+        # predictor caches this backbone result, so hundreds of objects reuse
+        # it instead of encoding the same frame hundreds of times.
+        if hasattr(self._predictor, "_get_image_feature"):
+            feature_started = time.perf_counter()
+            self._predictor._get_image_feature(
+                state.inference_state, predictor_frame_index, batch_size=1,
+            )
+            self._sync_cuda_for_timing()
+            timing.frame_feature_encoding_ms = (time.perf_counter() - feature_started) * 1000
+
+        propagation_started = time.perf_counter()
         if hasattr(self._predictor, "propagate_frame"):
             obj_ids, logits = self._predictor.propagate_frame(state.inference_state, predictor_frame_index)
         else:
@@ -598,19 +683,49 @@ class SAM2ModelManager:
                 state.inference_state, start_frame_idx=predictor_frame_index, max_frame_num_to_track=0,
             )
             _index, obj_ids, logits = next(iter(outputs))
-        logits_np = _as_numpy(logits)
+        self._sync_cuda_for_timing()
+        timing.sam2_propagation_ms = (time.perf_counter() - propagation_started) * 1000
+
+        postprocess_started = time.perf_counter()
+        if torch.is_tensor(logits):
+            detached = logits.detach()
+            masks = detached > 0
+            if masks.ndim >= 4 and masks.shape[1] == 1:
+                masks = masks[:, 0]
+            reduction_dims = tuple(range(1, detached.ndim))
+            confidences = torch.sigmoid(detached.float().abs().mean(dim=reduction_dims))
+            self._sync_cuda_for_timing()
+            timing.mask_postprocessing_ms = (time.perf_counter() - postprocess_started) * 1000
+            transfer_started = time.perf_counter()
+            masks_np = masks.cpu().numpy()
+            confidences_np = confidences.cpu().numpy()
+            timing.mask_transfer_ms = (time.perf_counter() - transfer_started) * 1000
+        else:
+            logits_np = np.asarray(logits)
+            masks_np = np.asarray(logits_np > 0)
+            if masks_np.ndim >= 4 and masks_np.shape[1] == 1:
+                masks_np = masks_np[:, 0]
+            reduction_dims = tuple(range(1, logits_np.ndim))
+            confidences_np = 1 / (
+                1 + np.exp(-np.mean(np.abs(logits_np), axis=reduction_dims))
+            )
+            timing.mask_postprocessing_ms = (time.perf_counter() - postprocess_started) * 1000
+
         by_id = {item.instance_id: item for item in state.instances}
         tracked: list[FruitInstance] = []
+        bbox_started = time.perf_counter()
+        boxes = _mask_boxes(masks_np)
         for index, object_id in enumerate(obj_ids):
             object_id = int(object_id)
             if object_id not in by_id:
                 continue
-            mask = np.asarray(logits_np[index] > 0).squeeze()
+            mask = np.asarray(masks_np[index]).squeeze()
             old = by_id[object_id]
-            confidence = float(1 / (1 + np.exp(-np.mean(np.abs(logits_np[index])))))
-            tracked.append(replace(old, box=mask_box(mask), mask=mask,
+            confidence = float(confidences_np[index])
+            tracked.append(replace(old, box=boxes[index], mask=mask,
                                    confidence=confidence, sam_score=confidence,
                                    last_seen_frame=frame_index, tracking_state="tracked"))
+        timing.bbox_extraction_ms = (time.perf_counter() - bbox_started) * 1000
         tracked_ids = {item.instance_id for item in tracked}
         missing = [replace(item, tracking_state="uncertain") for item in state.instances
                    if item.instance_id not in tracked_ids]
@@ -620,9 +735,16 @@ class SAM2ModelManager:
         elif tracked and np.mean([item.confidence or 0.0 for item in tracked]) < 0.5:
             self.request_refresh(state.camera_id, "low_confidence")
         state.instances = sorted(tracked, key=lambda item: item.instance_id)
+        state.propagation_count += 1
+        timing.propagation_number = state.propagation_count
+        timing.tracked_objects = len(state.instances)
         self._log_cuda_memory("after propagation")
         timing.propagation_ms += (time.perf_counter() - started) * 1000
         return state.instances
+
+    def _sync_cuda_for_timing(self) -> None:
+        if self.config.debug_timing and self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
 
     def request_refresh(self, camera_id: str, reason: str) -> bool:
         state = self._get_state(camera_id)
@@ -765,10 +887,13 @@ class SAM2ModelManager:
             cameras = len(self._states)
         return {
             "model_name": self.config.model_name,
+            "sam2_upstream_ref": SAM2_UPSTREAM_REF,
             "checkpoint": self.config.resolved_checkpoint,
             "config": self.config.resolved_config,
             "precision": self.config.precision,
             "compiled": self.config.vos_optimized,
+            "offload_video_to_cpu": self.config.offload_video_to_cpu,
+            "offload_state_to_cpu": self.config.offload_state_to_cpu,
             "device": str(self.device),
             "loaded": self._predictor is not None,
             "load_time_ms": self.load_time_ms,
@@ -807,6 +932,30 @@ def _restore_mask(mask: np.ndarray, shape: tuple[int, int], offset: tuple[int, i
     x, y = offset
     restored[y:y + mask.shape[0], x:x + mask.shape[1]] = mask
     return restored
+
+
+def _mask_boxes(masks: np.ndarray) -> list[list[float]]:
+    """Extract all boxes with vectorized row/column reductions.
+
+    Calling ``np.where`` separately for hundreds of full-resolution masks
+    allocates hundreds of coordinate arrays. Reducing the complete boolean
+    batch once preserves the public boxes/masks while avoiding that churn.
+    """
+    values = np.asarray(masks, dtype=bool)
+    if values.ndim == 2:
+        values = values[None]
+    rows = values.any(axis=2)
+    columns = values.any(axis=1)
+    valid = rows.any(axis=1) & columns.any(axis=1)
+    x1 = columns.argmax(axis=1)
+    y1 = rows.argmax(axis=1)
+    x2 = values.shape[2] - columns[:, ::-1].argmax(axis=1)
+    y2 = values.shape[1] - rows[:, ::-1].argmax(axis=1)
+    return [
+        [float(x1[i]), float(y1[i]), float(x2[i]), float(y2[i])]
+        if valid[i] else [0.0, 0.0, 0.0, 0.0]
+        for i in range(len(values))
+    ]
 
 
 def _as_numpy(value) -> np.ndarray:
@@ -849,6 +998,15 @@ def _latency_summary(values: deque[float]) -> dict[str, float | int]:
         "p99_ms": float(np.percentile(data, 99)),
         "fps": 1000.0 / mean if mean > 0 else 0.0,
     }
+
+
+def _torch_version_at_least(major: int, minor: int, patch: int) -> bool:
+    numeric = str(torch.__version__).split("+", 1)[0].split(".")
+    parsed = []
+    for value in numeric[:3]:
+        digits = "".join(character for character in value if character.isdigit())
+        parsed.append(int(digits or 0))
+    return tuple((parsed + [0, 0, 0])[:3]) >= (major, minor, patch)
 
 
 _MANAGER: SAM2ModelManager | None = None
