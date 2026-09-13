@@ -128,10 +128,10 @@ FP32 fallback there. The SAM2 dependency is pinned to upstream commit
 `2b90b9f5ceec907a1c18123530e92e794ad901a4` (Dec 16, 2024), which includes
 the independent-per-object predictor, full VOS compilation, and the fix for
 CPU-offloaded tracking state. `SAM2_VOS_OPTIMIZED=true|false` explicitly
-controls full-model compilation. When unset it defaults on only for a
-`sam2_video` service, leaving detector/image inference uncompiled. Full VOS
-compilation requires PyTorch 2.5.1 or newer and the first propagation can take
-substantially longer while kernels compile.
+controls full-model compilation. The balanced production default is `false`,
+which uses the new predictor without a potentially minutes-long compilation
+delay. Set it to `true` only when measured steady-state throughput is worth the
+startup cost. Full VOS compilation requires PyTorch 2.5.1 or newer.
 
 Refresh defaults are ten seconds or 30 **processed** frames, whichever becomes
 due first. Thirty source frames at 30 FPS is one second; 30 processed frames at

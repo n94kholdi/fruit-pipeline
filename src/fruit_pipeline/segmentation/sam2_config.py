@@ -236,10 +236,6 @@ class SAM2Config:
     @classmethod
     def from_env(cls) -> "SAM2Config":
         model = os.getenv("FRUIT_PIPELINE_SAM2_MODEL", "sam2.1_hiera_base_plus")
-        # Full-model compilation is a video optimization and can introduce
-        # small numerical differences. Enable it by default only for the
-        # video service; image/detector mode keeps its established path.
-        video_mode = os.getenv("FRUIT_PIPELINE_INFERENCE_MODE", "detector") == "sam2_video"
         auto_capacity = _auto_capacity_defaults()
         return cls(
             model_name=model,
@@ -247,7 +243,11 @@ class SAM2Config:
             config_file=os.getenv("FRUIT_PIPELINE_SAM2_CONFIG") or None,
             device=os.getenv("FRUIT_PIPELINE_DEVICE", "cuda"),
             precision=os.getenv("SAM2_PRECISION", "bf16").lower(),
-            vos_optimized=env_flag("SAM2_VOS_OPTIMIZED", video_mode),
+            # Balanced default: use the new independent-per-object predictor
+            # without full-model compilation. This avoids a potentially
+            # minutes-long first-request warmup. High-throughput deployments
+            # can still opt in explicitly after measuring startup behavior.
+            vos_optimized=env_flag("SAM2_VOS_OPTIMIZED", False),
             runtime=os.getenv("SAM2_RUNTIME", "pytorch").lower(),
             tensorrt_engine_dir=os.getenv("SAM2_TENSORRT_ENGINE_DIR", "/models/tensorrt"),
             tensorrt_precision=os.getenv("SAM2_TENSORRT_PRECISION", "fp16").lower(),

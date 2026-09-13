@@ -38,10 +38,10 @@ def test_all_sam21_variants_are_available_and_base_plus_is_default():
     assert config.resolved_config.endswith("sam2.1_hiera_b+.yaml")
 
 
-def test_vos_optimization_defaults_only_for_video_service(monkeypatch):
+def test_vos_optimization_is_opt_in_even_for_video_service(monkeypatch):
     monkeypatch.setenv("FRUIT_PIPELINE_INFERENCE_MODE", "sam2_video")
     monkeypatch.delenv("SAM2_VOS_OPTIMIZED", raising=False)
-    assert SAM2Config.from_env().vos_optimized is True
+    assert SAM2Config.from_env().vos_optimized is False
 
     monkeypatch.setenv("FRUIT_PIPELINE_INFERENCE_MODE", "detector")
     assert SAM2Config.from_env().vos_optimized is False
