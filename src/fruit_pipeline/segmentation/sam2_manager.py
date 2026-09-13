@@ -351,6 +351,7 @@ class SAM2ModelManager:
         state = self._get_state(camera_id)
         timing = SAM2Timing()
         frame_started = time.perf_counter()
+        state.last_activity = time.monotonic()
         with state.lock, torch.inference_mode(), self._autocast():
             self._validate_state_frame(state, image_rgb)
             state.processed_frames += 1
@@ -800,10 +801,28 @@ class SAM2ModelManager:
     def cleanup_idle(self, now: float | None = None) -> list[str]:
         current = now or time.monotonic()
         with self._states_lock:
-            stale = [key for key, state in self._states.items()
-                     if current - state.last_activity >= self.config.camera_idle_timeout_seconds]
-        for camera_id in stale:
-            self.stop_camera(camera_id)
+            candidates = [
+                (key, state) for key, state in self._states.items()
+                if current - state.last_activity >= self.config.camera_idle_timeout_seconds
+            ]
+        stale: list[str] = []
+        for camera_id, state in candidates:
+            with self._states_lock:
+                if self._states.get(camera_id) is not state:
+                    continue
+                with state.lock:
+                    if current - state.last_activity < self.config.camera_idle_timeout_seconds:
+                        continue
+                    self._states.pop(camera_id, None)
+                    stale.append(camera_id)
+            if self._predictor is not None:
+                with state.lock:
+                    self._predictor.reset_state(state.inference_state)
+                    state.instances.clear()
+                    if isinstance(state.inference_state, dict):
+                        state.inference_state.clear()
+        if stale:
+            self.release_unused_cuda_memory()
         return stale
 
     def _get_state(self, camera_id: str) -> CameraVideoState:
