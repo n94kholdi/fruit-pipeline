@@ -22,19 +22,23 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         id: python
         with:
           python-version: "3.11"
           cache: pip
+
       - name: Restore test environment
         id: test-venv
         uses: actions/cache@v4
         with:
           path: .venv
           key: ${{ runner.os }}-python-${{ steps.python.outputs.python-version }}-test-venv-v1-${{ hashFiles('pyproject.toml') }}
+
       - name: Install test dependencies
         if: steps.test-venv.outputs.cache-hit != 'true'
         run: |
@@ -45,8 +49,10 @@ jobs:
             "torchvision==0.20.1" \
             --index-url https://download.pytorch.org/whl/cpu
           .venv/bin/python -m pip install --editable ".[api,dev]"
+
       - name: Refresh editable project install
         run: .venv/bin/python -m pip install --no-deps --editable .
+
       - run: .venv/bin/pytest -q
 
   build-and-push:
@@ -54,17 +60,21 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
+
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Lowercase image name
         run: echo "IMAGE_NAME=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
       - id: meta
         uses: docker/metadata-action@v5
         with:
@@ -76,14 +86,26 @@ jobs:
             type=sha,format=short,prefix=sha-
             type=ref,event=tag
             type=semver,pattern={{raw}}
+
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+
+          # Dockerfile's FROM points at:
+          # ghcr.io/n94kholdi/fruit-pipeline-base:py3.11-torch2.5.1-cu118
+          #
+          # The base image is built independently and is not rebuilt for
+          # normal application commits.
+          pull: true
+
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
           cache-from: type=gha,scope=fruit-pipeline
-          # This is a single-stage image, so min preserves all reusable final
-          # layers without exporting extra intermediate BuildKit cache records.
+
+          # Single-stage application image: preserve reusable final layers
+          # without exporting unnecessary intermediate cache records.
           cache-to: type=gha,mode=min,scope=fruit-pipeline
+
           build-args: VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}

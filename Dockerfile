@@ -1,4 +1,8 @@
-FROM python:3.11-slim
+# torch and torchvision are provided by this base image
+# (python:3.11-slim + the pinned PyTorch/torchvision CUDA build).
+# The base image is rebuilt only when Python, PyTorch, torchvision,
+# or the CUDA wheel flavor changes.
+FROM ghcr.io/n94kholdi/fruit-pipeline-base:py3.11-torch2.5.1-cu118
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -16,26 +20,16 @@ RUN apt-get update \
     && apt-get install --no-install-recommends --yes ffmpeg git libglib2.0-0 libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-ARG PYTORCH_VERSION=2.5.1
-ARG TORCHVISION_VERSION=0.20.1
-ARG PYTORCH_CUDA_FLAVOR=cu118
-
-# CUDA 11.8 runs on NVIDIA Linux drivers >= 450.80.02 and remains compatible
-# with newer drivers. Override PYTORCH_CUDA_FLAVOR (cu121 or cu124 for these
-# pinned PyTorch versions) when deploying to hardware that requires it. Keep
-# this independent of project metadata so dependency edits do not invalidate
-# the image's largest and most expensive layer.
-RUN python -m pip install --no-cache-dir \
-        "torch==${PYTORCH_VERSION}" \
-        "torchvision==${TORCHVISION_VERSION}" \
-        --index-url "https://download.pytorch.org/whl/${PYTORCH_CUDA_FLAVOR}" \
-    && python -c "import torch; expected='${PYTORCH_CUDA_FLAVOR}'; actual='cu' + str(torch.version.cuda).replace('.', ''); assert torch.__version__.startswith('${PYTORCH_VERSION}+'), f'Unexpected PyTorch version: {torch.__version__}'; assert actual == expected, f'Expected {expected}, installed {actual}'"
-
-# Install application dependencies in a separate layer. The temporary package
-# is enough for pip to read dependency metadata and create console entry points.
-# PYTHONPATH points those entry points at the real source copied below, so normal
-# source edits do not invalidate either dependency layer.
+# Install application dependencies in a separate layer.
+# The temporary package is enough for pip to read dependency metadata and
+# create console entry points. PYTHONPATH points those entry points at the
+# real source copied below, so normal source edits do not invalidate the
+# dependency layer.
+#
+# torch and torchvision are already installed by the reusable base image,
+# so pip reuses them instead of downloading the CUDA wheels again.
 COPY pyproject.toml README.md ./
+
 RUN mkdir -p src/fruit_pipeline \
     && touch src/fruit_pipeline/__init__.py \
     && python -m pip install --no-cache-dir ".[api]" \
@@ -49,14 +43,17 @@ COPY src ./src
 COPY config ./config
 
 USER appuser
+
 EXPOSE 8010
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3)" || exit 1
 
-# VERSION changes for every commit. Keep it after the expensive dependency and
-# source layers so a new image label does not invalidate those cached layers.
+# VERSION changes for every commit. Keep it after the expensive dependency
+# and source layers so a new image label does not invalidate those cached
+# layers.
 ARG VERSION=dev
+
 LABEL org.opencontainers.image.title="fruit-pipeline" \
       org.opencontainers.image.version="${VERSION}"
 
