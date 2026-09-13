@@ -54,6 +54,8 @@ def test_fruit_job_runs_in_process_to_reuse_startup_model(tmp_path, monkeypatch)
     monkeypatch.setattr(dashboard_api, "JOB_DIR", tmp_path / "jobs")
     monkeypatch.setattr(dashboard_api, "CALIBRATION_DIR", tmp_path / "calibrations")
     monkeypatch.setattr(dashboard_api, "PALLET_CONFIG", tmp_path / "pallet_types.yaml")
+    monkeypatch.setattr(dashboard_api, "SAM_CHECKPOINT", "/models/sam_vit_b_01ec64.pth")
+    monkeypatch.setattr(dashboard_api, "SAM_MODEL_TYPE", "vit_b")
     monkeypatch.setattr(integrated_cli, "main", lambda argv: calls.append(argv) or 0)
     monkeypatch.setattr(
         dashboard_api,
@@ -68,6 +70,8 @@ def test_fruit_job_runs_in_process_to_reuse_startup_model(tmp_path, monkeypatch)
     dashboard_api._run_fruit_job("job-in-process", _fruit_job_request(), source)
 
     assert calls and calls[0][0:2] == ["--image", str(source)]
+    assert calls[0][calls[0].index("--sam-checkpoint") + 1] == "/models/sam_vit_b_01ec64.pth"
+    assert calls[0][calls[0].index("--sam-model-type") + 1] == "vit_b"
     assert dashboard_api._job("job-in-process")["status"] == "completed"
     assert "job-in-process" not in dashboard_api.job_processes
 

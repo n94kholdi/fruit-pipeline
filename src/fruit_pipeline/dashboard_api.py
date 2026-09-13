@@ -431,6 +431,7 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
         "--frame-step", str(request.frame_step),
         "--min-pallet-overlap", str(request.min_pallet_overlap),
         "--sam-checkpoint", SAM_CHECKPOINT,
+        "--sam-model-type", SAM_MODEL_TYPE,
         "--device", DEVICE,
         "--inference-mode", request.inference_mode,
         "--live-job-dir", str(job_dir),
