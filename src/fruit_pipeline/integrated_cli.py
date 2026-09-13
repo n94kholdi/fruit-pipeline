@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -158,6 +160,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         detection_config = _config_from_args(args, str(source), str(output_dir))
     else:
         sam2_video_config = SAM2Config.from_env()
+        is_live_stream = "://" in str(source)
+        if not is_live_stream and "SAM2_REFRESH_SECONDS" not in os.environ:
+            # A local video file has no wall-clock relationship to its
+            # playback time -- frames are pulled through as fast as SAM2 can
+            # run, back-to-back, with no real-time pacing (unlike a live
+            # RTSP/HTTP stream, where the read() cadence roughly tracks real
+            # time). refresh_seconds is designed for that live-stream case:
+            # a fixed number of *wall-clock* seconds between full discovery
+            # passes. For a batch file, once one discovery pass (expensive
+            # automatic mask generation) takes longer than refresh_seconds,
+            # the next frame is already "due" again, so every subsequent
+            # frame re-runs full discovery instead of cheap propagation --
+            # each one slower than the last. Force pure frame-count-based
+            # refresh (refresh_processed_frames) here instead, the same way
+            # scripts/benchmark_sam2.py already does for offline benchmarking.
+            sam2_video_config = replace(sam2_video_config, refresh_seconds=0.0)
     sizing_config = SizeEstimationConfig(
         camera_id=args.camera_id,
         camera_group=args.camera_group,
