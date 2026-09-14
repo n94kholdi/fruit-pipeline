@@ -2,7 +2,7 @@ name: Test and publish fruit-pipeline image
 
 on:
   push:
-    branches: [master, main, development, dashoard-integration]
+    branches: [master, main, development, dashoard-integration, feat-sam-optimization]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -22,47 +22,90 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: "3.11"
           cache: pip
-      - run: python -m pip install ".[api,dev]"
-      - run: pytest -q
+
+      - name: Restore test environment
+        id: test-venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: ${{ runner.os }}-python-${{ steps.python.outputs.python-version }}-test-venv-v1-${{ hashFiles('pyproject.toml') }}
+
+      - name: Install test dependencies
+        if: steps.test-venv.outputs.cache-hit != 'true'
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install \
+            "torch==2.5.1" \
+            "torchvision==0.20.1" \
+            --index-url https://download.pytorch.org/whl/cpu
+          .venv/bin/python -m pip install --editable ".[api,dev]"
+
+      - name: Refresh editable project install
+        run: .venv/bin/python -m pip install --no-deps --editable .
+
+      - run: .venv/bin/pytest -q
 
   build-and-push:
     if: github.event_name != 'pull_request'
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
+
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Lowercase image name
         run: echo "IMAGE_NAME=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            type=ref,event=branch
             type=raw,value=dashoard-integration,enable=${{ github.ref == 'refs/heads/dashoard-integration' }}
             type=raw,value=${{ github.sha }}
             type=sha,format=short,prefix=sha-
             type=ref,event=tag
             type=semver,pattern={{raw}}
+
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+
+          # Dockerfile's FROM points at:
+          # ghcr.io/n94kholdi/fruit-pipeline-base:py3.11-torch2.5.1-cu118
+          #
+          # The base image is built independently and is not rebuilt for
+          # normal application commits.
+          pull: true
+
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+
+          cache-from: type=gha,scope=fruit-pipeline
+
+          # Single-stage application image: preserve reusable final layers
+          # without exporting unnecessary intermediate cache records.
+          cache-to: type=gha,mode=min,scope=fruit-pipeline
+
           build-args: VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}

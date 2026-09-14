@@ -9,6 +9,7 @@ from pathlib import Path
 from fruit_pipeline.detection.backends import YOLOE_MODES
 from fruit_pipeline.pipeline import PipelineConfig, load_models, run_pipeline
 from fruit_pipeline.segmentation.sam import SAM_MODEL_TYPES
+from fruit_pipeline.segmentation.sam_manager import env_flag
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -254,6 +255,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sam.add_argument("--sam-model-type", choices=list(SAM_MODEL_TYPES), default="vit_l", help="SAM backbone size.")
     sam.add_argument("--sam-batch-size", type=int, default=16, help="Boxes per batched SAM predict_torch call.")
+    sam.add_argument(
+        "--sam-fp16",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag("FRUIT_PIPELINE_SAM_USE_FP16", True),
+        help="Use CUDA FP16 autocast for SAM (default: enabled; env: FRUIT_PIPELINE_SAM_USE_FP16).",
+    )
 
     filters = parser.add_argument_group("mask sanity filters")
     filters.add_argument("--min-mask-area", type=int, default=30, help="Drop masks smaller than this, in pixels.")
@@ -315,6 +322,7 @@ def _config_from_args(args, image_path: str, output_dir: str) -> PipelineConfig:
         sam_checkpoint=args.sam_checkpoint,
         sam_model_type=args.sam_model_type,
         sam_batch_size=args.sam_batch_size,
+        sam_use_fp16=args.sam_fp16,
         min_mask_area=args.min_mask_area,
         border_filter_enabled=not args.no_border_filter,
         border_touch_ratio=args.border_touch_ratio,

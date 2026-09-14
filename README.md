@@ -337,6 +337,37 @@ batch.
   `vit_l` (default, balanced), or `vit_h` (best quality, slowest/heaviest).
 - `--sam-batch-size` (default `16`): boxes per batched SAM `predict_torch`
   call; raise/lower based on available GPU/CPU memory.
+- `--sam-fp16` / `--no-sam-fp16` (default: enabled): control CUDA FP16
+  autocast. `FRUIT_PIPELINE_SAM_USE_FP16=false` changes the default without
+  changing command lines. CPU inference always uses FP32.
+
+### Persistent SAM runtime and benchmarking
+
+SAM is owned by a process-wide `SAMModelManager`, keyed by checkpoint, model
+type, device, and precision. The checkpoint is loaded once, gradients are
+disabled, and the GPU-resident model is reused. Image encoding and prompt
+decoding are separate calls, so a later video pipeline can retain embeddings
+or insert tracking and periodic SAM refreshes without changing application
+logic. The manager serializes access to the predictor's mutable image state.
+
+For an RTX A6000 deployment, use `FRUIT_PIPELINE_DEVICE=cuda` and leave
+`FRUIT_PIPELINE_SAM_USE_FP16=true`. To compare cold FP32 behavior with the
+persistent FP16 path on a representative image and prompt boxes:
+
+```bash
+python scripts/benchmark_sam.py \
+  --image data/example.jpg \
+  --boxes-json outputs/example_detections.json \
+  --device cuda \
+  --iterations 5 \
+  --output benchmarks/sam_a6000.json
+```
+
+The report includes model loading, preprocessing, image encoder, prompt
+encoder, mask decoder, postprocessing, total inference, effective FPS, and
+peak allocated/reserved GPU memory. CUDA synchronization is enabled only in this
+profiling utility, not in normal inference. It also reports mask IoU, pixel
+agreement, and score drift between FP32 and the selected optimized precision.
 
 **Mask sanity filters**
 - `--min-mask-area` (default `30` px): drop degenerate near-zero-area masks.

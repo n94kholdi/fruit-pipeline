@@ -17,6 +17,7 @@ from pathlib import Path
 
 from fruit_pipeline.sam_only_pipeline import SamOnlyConfig, load_models, run_sam_only_pipeline
 from fruit_pipeline.segmentation.sam import SAM_MODEL_TYPES
+from fruit_pipeline.segmentation.sam_manager import env_flag
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -46,6 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to a SAM checkpoint matching --sam-model-type.",
     )
     sam.add_argument("--sam-model-type", choices=list(SAM_MODEL_TYPES), default="vit_l", help="SAM backbone size.")
+    sam.add_argument(
+        "--sam-fp16",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag("FRUIT_PIPELINE_SAM_USE_FP16", True),
+        help="Use CUDA FP16 autocast for SAM (default: enabled; env: FRUIT_PIPELINE_SAM_USE_FP16).",
+    )
     sam.add_argument(
         "--category-name",
         default="fruit",
@@ -149,6 +156,7 @@ def _config_from_args(args, image_path: str, output_dir: str) -> SamOnlyConfig:
         crop_overlap_ratio=args.crop_overlap_ratio,
         crop_n_points_downscale_factor=args.crop_n_points_downscale_factor,
         min_mask_region_area=args.min_mask_region_area,
+        sam_use_fp16=args.sam_fp16,
         min_mask_area=args.min_mask_area,
         border_filter_enabled=not args.no_border_filter,
         border_touch_ratio=args.border_touch_ratio,
