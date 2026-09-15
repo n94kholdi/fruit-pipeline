@@ -44,6 +44,8 @@ SAM_CHECKPOINT = os.getenv("FRUIT_PIPELINE_SAM_CHECKPOINT", "models/sam_vit_l_0b
 DEVICE = os.getenv("FRUIT_PIPELINE_DEVICE", "cpu")
 SAM_MODEL_TYPE = os.getenv("FRUIT_PIPELINE_SAM_MODEL_TYPE", "vit_l")
 SAM_USE_FP16 = env_flag("FRUIT_PIPELINE_SAM_USE_FP16", True)
+SAM_USE_COMPILE = env_flag("FRUIT_PIPELINE_SAM_TORCH_COMPILE", False)
+SAM_USE_SDPA_ATTENTION = env_flag("FRUIT_PIPELINE_SAM_SDPA_ATTENTION", False)
 MAX_UPLOAD_BYTES = int(os.getenv("FRUIT_PIPELINE_MAX_UPLOAD_BYTES", str(1024**3)))
 WORKERS = max(1, int(os.getenv("FRUIT_PIPELINE_JOB_WORKERS", "1")))
 MAX_CAPTURED_CALIBRATION_FRAMES = 300
@@ -62,6 +64,8 @@ def preload_sam_model() -> None:
         model_type=SAM_MODEL_TYPE,
         device=resolve_device(DEVICE),
         use_fp16=SAM_USE_FP16,
+        use_compile=SAM_USE_COMPILE,
+        use_sdpa_attention=SAM_USE_SDPA_ATTENTION,
     )
 
 
