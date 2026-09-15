@@ -128,6 +128,9 @@ class SAMModelManager:
         use_fp16: bool = True,
         *,
         profile: bool = False,
+        use_compile: bool = False,
+        compile_mode: str = "default",
+        use_sdpa_attention: bool = False,
     ) -> None:
         if model_type not in SAM_MODEL_TYPES:
             raise ValueError(f"Unknown SAM model_type '{model_type}', expected one of {SAM_MODEL_TYPES}")
@@ -136,6 +139,9 @@ class SAMModelManager:
         self.device = torch.device(device)
         self.use_fp16 = bool(use_fp16 and self.device.type == "cuda")
         self.profile = profile
+        self.use_compile = bool(use_compile and self.device.type == "cuda")
+        self.compile_mode = compile_mode
+        self.use_sdpa_attention = use_sdpa_attention
         self._model = None
         self._predictor = None
         self._load_lock = threading.Lock()
@@ -143,6 +149,8 @@ class SAMModelManager:
         self.model_loading_ms = 0.0
         if use_fp16 and self.device.type != "cuda":
             logger.info("SAM FP16 requested on %s; using FP32 because autocast is CUDA-only", self.device)
+        if use_compile and self.device.type != "cuda":
+            logger.info("SAM torch.compile requested on %s; skipping (CUDA-only for now)", self.device)
 
     def load_model(self):
         """Load once, disable gradients, move to the target device, and cache."""
@@ -165,18 +173,69 @@ class SAMModelManager:
             model.eval()
             model.requires_grad_(False)
             model.to(device=self.device)
+
+            if self.use_sdpa_attention:
+                self.use_sdpa_attention = self._try_apply_sdpa_attention()
+
+            if self.use_compile:
+                self.use_compile = self._try_compile_image_encoder(model)
+
             self._model = model
             self._predictor = SamPredictor(model)
             self.model_loading_ms = (time.perf_counter() - started) * 1000.0
             logger.info(
-                "Loaded persistent SAM (%s) from %s on %s in %.1f ms (fp16=%s)",
+                "Loaded persistent SAM (%s) from %s on %s in %.1f ms (fp16=%s, compile=%s, sdpa_attention=%s)",
                 self.model_type,
                 self.checkpoint,
                 self.device,
                 self.model_loading_ms,
                 self.use_fp16,
+                self.use_compile,
+                self.use_sdpa_attention,
             )
             return model
+
+    def _try_apply_sdpa_attention(self) -> bool:
+        try:
+            from fruit_pipeline.segmentation.sam_attention_patch import apply_sdpa_attention
+
+            return apply_sdpa_attention()
+        except Exception:
+            logger.exception("Could not enable SDPA attention for SAM; keeping eager attention")
+            return False
+
+    def _try_compile_image_encoder(self, model) -> bool:
+        """Compile the image encoder only: it dominates SAM's runtime, and its
+        fixed input resolution makes a warmup-validated compile low risk. The
+        mask decoder is left eager -- it is comparatively cheap and its
+        prompt-dependent shapes (variable box-batch size) are a much more
+        likely source of recompiles/graph breaks.
+        """
+        if not hasattr(torch, "compile"):
+            logger.warning(
+                "SAM torch.compile requested but unavailable in torch %s; running eager",
+                torch.__version__,
+            )
+            return False
+        original_encoder = model.image_encoder
+        try:
+            compiled_encoder = torch.compile(original_encoder, mode=self.compile_mode)
+            img_size = getattr(original_encoder, "img_size", 1024)
+            # fp32 input, matching encode_image()'s real inputs: autocast (if
+            # enabled) casts activations to fp16 internally, master weights
+            # and inputs stay fp32.
+            dummy = torch.zeros(1, 3, img_size, img_size, device=self.device, dtype=torch.float32)
+            with torch.inference_mode(), self._autocast():
+                _ = compiled_encoder(dummy)
+        except Exception:
+            logger.exception(
+                "torch.compile warmup failed for SAM image_encoder; falling back to eager execution"
+            )
+            model.image_encoder = original_encoder
+            return False
+        model.image_encoder = compiled_encoder
+        logger.info("torch.compile enabled for SAM image_encoder (mode=%s)", self.compile_mode)
+        return True
 
     def get_model(self):
         return self.load_model()
@@ -330,7 +389,7 @@ class SAMModelManager:
             yield
 
 
-_MANAGERS: dict[tuple[str, str, str, bool], SAMModelManager] = {}
+_MANAGERS: dict[tuple[str, str, str, bool, bool, bool], SAMModelManager] = {}
 _MANAGERS_LOCK = threading.Lock()
 
 
@@ -340,15 +399,34 @@ def get_sam_model_manager(
     device: str = "cuda",
     use_fp16: bool = True,
     *,
+    use_compile: bool = False,
+    compile_mode: str = "default",
+    use_sdpa_attention: bool = False,
     eager: bool = True,
 ) -> SAMModelManager:
-    """Return the process-wide manager for one model/device/precision tuple."""
+    """Return the process-wide manager for one model/device/precision/optimization tuple."""
     resolved = resolve_model_path(checkpoint)
-    key = (resolved, model_type, str(torch.device(device)), bool(use_fp16 and torch.device(device).type == "cuda"))
+    is_cuda = torch.device(device).type == "cuda"
+    key = (
+        resolved,
+        model_type,
+        str(torch.device(device)),
+        bool(use_fp16 and is_cuda),
+        bool(use_compile and is_cuda),
+        bool(use_sdpa_attention),
+    )
     with _MANAGERS_LOCK:
         manager = _MANAGERS.get(key)
         if manager is None:
-            manager = SAMModelManager(resolved, model_type, device, use_fp16)
+            manager = SAMModelManager(
+                resolved,
+                model_type,
+                device,
+                use_fp16,
+                use_compile=use_compile,
+                compile_mode=compile_mode,
+                use_sdpa_attention=use_sdpa_attention,
+            )
             _MANAGERS[key] = manager
     if eager:
         manager.load_model()

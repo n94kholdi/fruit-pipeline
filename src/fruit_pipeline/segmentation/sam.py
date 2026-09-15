@@ -55,9 +55,21 @@ def load_sam_manager(
     model_type: str = "vit_l",
     device: str = "cpu",
     use_fp16: bool = True,
+    *,
+    use_compile: bool = False,
+    compile_mode: str = "default",
+    use_sdpa_attention: bool = False,
 ) -> SAMModelManager:
     """Load or reuse the persistent manager used by production pipelines."""
-    return get_sam_model_manager(checkpoint, model_type, device, use_fp16)
+    return get_sam_model_manager(
+        checkpoint,
+        model_type,
+        device,
+        use_fp16,
+        use_compile=use_compile,
+        compile_mode=compile_mode,
+        use_sdpa_attention=use_sdpa_attention,
+    )
 
 
 def segment_boxes(
