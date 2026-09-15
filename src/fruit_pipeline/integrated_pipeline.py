@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
@@ -29,6 +29,11 @@ from fruit_pipeline.sam_only_pipeline import SamOnlyConfig
 from fruit_pipeline.sam_only_pipeline import load_models as load_sam_only_models
 from fruit_pipeline.sam_only_pipeline import run_sam_only_pipeline
 from fruit_pipeline.segmentation.sam import FruitInstance
+from fruit_pipeline.segmentation.video_segmentation import (
+    VideoFrameTimings,
+    VideoSegmentationConfig,
+    VideoSegmentationManager,
+)
 from fruit_pipeline.size_estimation.manual_selection import load_points, select_points
 from fruit_pipeline.size_estimation.pipeline import (
     SizeEstimationConfig,
@@ -78,6 +83,7 @@ class IntegratedPipelineConfig:
     input_rotation: str = "auto"
     reuse_pallet_selection: bool = False
     min_pallet_overlap: float = 0.5
+    video_segmentation: VideoSegmentationConfig = field(default_factory=VideoSegmentationConfig)
 
     def __post_init__(self) -> None:
         if (self.detection is None) == (self.sam_only is None):
@@ -104,6 +110,9 @@ class FrameResult:
     sizing: SizeEstimationResult
     artifact_dir: str
     full_image_num_fruits: int
+    used_sam: bool = True
+    sam_ms: float = 0.0
+    tracking_ms: float = 0.0
 
     @property
     def num_fruits(self) -> int:
@@ -121,6 +130,9 @@ class FrameResult:
             "pallet_type": self.sizing.pallet_detection.pallet_type,
             "pallet_confidence": self.sizing.pallet_detection.confidence,
             "artifact_dir": self.artifact_dir,
+            "used_sam": self.used_sam,
+            "sam_ms": round(self.sam_ms, 2),
+            "tracking_ms": round(self.tracking_ms, 2),
             "fruits": [
                 _fruit_record(instance, measurements.get(instance.instance_id))
                 for instance in self.instances
@@ -252,6 +264,7 @@ class IntegratedFruitSizingPipeline:
         self._frame_processed = frame_processed
         self._sizing_pipeline: SizeEstimationPipeline | None = None
         self._calibration_resolution: tuple[int, int] | None = None
+        self._video_segmentation_manager: VideoSegmentationManager | None = None
 
     def prepare_pallet(self, image_bgr: np.ndarray) -> PalletDetector:
         """Load or collect pallet corners, validate them, and save a preview.
@@ -362,6 +375,7 @@ class IntegratedFruitSizingPipeline:
             raise FileNotFoundError(f"Cannot open video or stream: {source}")
 
         frames: list[FrameResult] = []
+        self._video_segmentation_manager = VideoSegmentationManager(self.config.video_segmentation)
         try:
             ok, first_frame = capture.read()
             if not ok or first_frame is None:
@@ -398,12 +412,18 @@ class IntegratedFruitSizingPipeline:
                     frame_path = artifact_dir / f"{stem}_frame_{frame_index:06d}.jpg"
                     if not cv2.imwrite(str(frame_path), processing_frame):
                         raise OSError(f"Cannot write sampled frame: {frame_path}")
+                    full_image_instances, frame_timings = self._video_segmentation_manager.process(
+                        processing_frame,
+                        run_sam=lambda: self._discover_instances(frame_path, artifact_dir),
+                    )
                     frame_result = self._process_frame(
                         processing_frame,
                         frame_path,
                         frame_index,
                         _finite_float_or_none(capture.get(cv2.CAP_PROP_POS_MSEC)),
                         artifact_dir,
+                        full_image_instances=full_image_instances,
+                        frame_timings=frame_timings,
                     )
                     frames.append(frame_result)
                     self._notify_frame(
@@ -478,6 +498,31 @@ class IntegratedFruitSizingPipeline:
             model_config = replace(self.config.detection, image_path=image_path)
             self.detector, self.sam_predictor = self._model_loader(model_config)
 
+    def _discover_instances(self, image_path: Path, artifact_dir: Path) -> list[FruitInstance]:
+        """Run the configured backend (SAM-only or detector+SAM) on one image.
+
+        This is the only place that actually calls SAM to *discover* new
+        instances; video mode gates calls to it through
+        ``VideoSegmentationManager`` so it does not run on every frame.
+        """
+        if self.config.inference_mode == "sam_only":
+            inference_config = replace(
+                self.config.sam_only,
+                image_path=str(image_path),
+                output_dir=str(artifact_dir),
+            )
+            return self._sam_only_runner(inference_config, generator=self.sam_generator)
+        detection_config = replace(
+            self.config.detection,
+            image_path=str(image_path),
+            output_dir=str(artifact_dir),
+        )
+        return self._detection_runner(
+            detection_config,
+            detector=self.detector,
+            sam_predictor=self.sam_predictor,
+        )
+
     def _process_frame(
         self,
         image_bgr: np.ndarray,
@@ -485,29 +530,13 @@ class IntegratedFruitSizingPipeline:
         frame_index: int | None,
         timestamp_ms: float | None,
         artifact_dir: Path,
+        *,
+        full_image_instances: list[FruitInstance] | None = None,
+        frame_timings: VideoFrameTimings | None = None,
     ) -> FrameResult:
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        if self.config.inference_mode == "sam_only":
-            inference_config = replace(
-                self.config.sam_only,
-                image_path=str(image_path),
-                output_dir=str(artifact_dir),
-            )
-            full_image_instances = self._sam_only_runner(
-                inference_config,
-                generator=self.sam_generator,
-            )
-        else:
-            detection_config = replace(
-                self.config.detection,
-                image_path=str(image_path),
-                output_dir=str(artifact_dir),
-            )
-            full_image_instances = self._detection_runner(
-                detection_config,
-                detector=self.detector,
-                sam_predictor=self.sam_predictor,
-            )
+        if full_image_instances is None:
+            full_image_instances = self._discover_instances(image_path, artifact_dir)
         pallet_detection = self.pallet_detector.detect(image_bgr)
         if pallet_detection is None:
             raise PalletGeometryError("No pallet detected while filtering fruit")
@@ -534,6 +563,9 @@ class IntegratedFruitSizingPipeline:
             sizing=sizing_result,
             artifact_dir=str(artifact_dir),
             full_image_num_fruits=len(full_image_instances),
+            used_sam=frame_timings.used_sam if frame_timings is not None else True,
+            sam_ms=frame_timings.sam_ms if frame_timings is not None else 0.0,
+            tracking_ms=frame_timings.tracking_ms if frame_timings is not None else 0.0,
         )
         result_path = artifact_dir / f"{image_path.stem}_result.json"
         result_path.write_text(json.dumps(frame_result.to_dict(), indent=2) + "\n", encoding="utf-8")
