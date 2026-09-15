@@ -31,6 +31,8 @@ def test_startup_preloads_the_persistent_sam_manager(tmp_path, monkeypatch):
     monkeypatch.setattr(dashboard_api, "SAM_CHECKPOINT", str(checkpoint))
     monkeypatch.setattr(dashboard_api, "SAM_MODEL_TYPE", "vit_l")
     monkeypatch.setattr(dashboard_api, "SAM_USE_FP16", True)
+    monkeypatch.setattr(dashboard_api, "SAM_USE_COMPILE", False)
+    monkeypatch.setattr(dashboard_api, "SAM_USE_SDPA_ATTENTION", False)
     monkeypatch.setattr(dashboard_api, "DEVICE", "cpu")
     monkeypatch.setattr(
         dashboard_api,
@@ -41,7 +43,16 @@ def test_startup_preloads_the_persistent_sam_manager(tmp_path, monkeypatch):
     dashboard_api.preload_sam_model()
 
     assert calls == [
-        ((str(checkpoint),), {"model_type": "vit_l", "device": "cpu", "use_fp16": True})
+        (
+            (str(checkpoint),),
+            {
+                "model_type": "vit_l",
+                "device": "cpu",
+                "use_fp16": True,
+                "use_compile": False,
+                "use_sdpa_attention": False,
+            },
+        )
     ]
 
 

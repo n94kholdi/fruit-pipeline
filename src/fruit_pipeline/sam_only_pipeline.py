@@ -50,6 +50,12 @@ class SamOnlyConfig:
     sam_use_fp16: bool = field(
         default_factory=lambda: env_flag("FRUIT_PIPELINE_SAM_USE_FP16", True)
     )
+    sam_use_compile: bool = field(
+        default_factory=lambda: env_flag("FRUIT_PIPELINE_SAM_TORCH_COMPILE", False)
+    )
+    sam_use_sdpa_attention: bool = field(
+        default_factory=lambda: env_flag("FRUIT_PIPELINE_SAM_SDPA_ATTENTION", False)
+    )
 
     # Mask sanity filters (same knobs/defaults as fruit_pipeline.cli)
     min_mask_area: int = 30
@@ -81,6 +87,8 @@ def load_models(config: SamOnlyConfig):
         crop_n_points_downscale_factor=config.crop_n_points_downscale_factor,
         min_mask_region_area=config.min_mask_region_area,
         use_fp16=config.sam_use_fp16,
+        use_compile=config.sam_use_compile,
+        use_sdpa_attention=config.sam_use_sdpa_attention,
     )
 
 

@@ -39,6 +39,16 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Profile the optimized path in FP32 (FP16 is enabled by default).",
     )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Also enable torch.compile on the image encoder for the optimized path.",
+    )
+    parser.add_argument(
+        "--sdpa-attention",
+        action="store_true",
+        help="Also enable SDPA/FlashAttention-backed attention for the optimized path.",
+    )
     return parser
 
 
@@ -100,6 +110,8 @@ def main() -> int:
         args.device,
         use_fp16=not args.no_fp16,
         profile=True,
+        use_compile=args.compile,
+        use_sdpa_attention=args.sdpa_attention,
     )
     optimized.load_model()
     for _ in range(args.warmup):
@@ -133,6 +145,8 @@ def main() -> int:
             "model_type": args.model_type,
             "device": args.device,
             "optimized_fp16": optimized.use_fp16,
+            "optimized_compile": optimized.use_compile,
+            "optimized_sdpa_attention": optimized.use_sdpa_attention,
             "iterations": args.iterations,
             "warmup": args.warmup,
         },

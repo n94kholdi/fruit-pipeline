@@ -69,6 +69,12 @@ class PipelineConfig:
     sam_use_fp16: bool = field(
         default_factory=lambda: env_flag("FRUIT_PIPELINE_SAM_USE_FP16", True)
     )
+    sam_use_compile: bool = field(
+        default_factory=lambda: env_flag("FRUIT_PIPELINE_SAM_TORCH_COMPILE", False)
+    )
+    sam_use_sdpa_attention: bool = field(
+        default_factory=lambda: env_flag("FRUIT_PIPELINE_SAM_SDPA_ATTENTION", False)
+    )
 
     # Mask sanity filters
     min_mask_area: int = 30
@@ -133,6 +139,8 @@ def load_models(config: PipelineConfig):
         model_type=config.sam_model_type,
         device=device,
         use_fp16=config.sam_use_fp16,
+        use_compile=config.sam_use_compile,
+        use_sdpa_attention=config.sam_use_sdpa_attention,
     )
     return detector, sam_predictor
 
@@ -267,6 +275,8 @@ def run_pipeline(config: PipelineConfig, detector=None, sam_predictor=None) -> l
             model_type=config.sam_model_type,
             device=device,
             use_fp16=config.sam_use_fp16,
+            use_compile=config.sam_use_compile,
+            use_sdpa_attention=config.sam_use_sdpa_attention,
         )
     instances = segment_boxes(
         image_rgb=image_rgb,

@@ -41,6 +41,8 @@ def load_sam_automatic_generator(
     crop_n_points_downscale_factor: int = 1,
     min_mask_region_area: int = 0,
     use_fp16: bool = True,
+    use_compile: bool = False,
+    use_sdpa_attention: bool = False,
 ):
     """Load a pretrained SAM checkpoint and return a ``SamAutomaticMaskGenerator``.
 
@@ -63,7 +65,14 @@ def load_sam_automatic_generator(
     """
     from segment_anything import SamAutomaticMaskGenerator
 
-    manager = get_sam_model_manager(checkpoint, model_type, device, use_fp16)
+    manager = get_sam_model_manager(
+        checkpoint,
+        model_type,
+        device,
+        use_fp16,
+        use_compile=use_compile,
+        use_sdpa_attention=use_sdpa_attention,
+    )
     generator = SamAutomaticMaskGenerator(
         manager.get_model(),
         points_per_side=points_per_side,

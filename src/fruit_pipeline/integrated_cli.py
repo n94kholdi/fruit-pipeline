@@ -15,6 +15,8 @@ from fruit_pipeline.integrated_pipeline import (
 )
 from fruit_pipeline.live import FruitLiveReporter
 from fruit_pipeline.sam_only_pipeline import SamOnlyConfig
+from fruit_pipeline.segmentation.tracking import TRACKER_TYPES
+from fruit_pipeline.segmentation.video_segmentation import VideoSegmentationConfig
 from fruit_pipeline.size_estimation.pipeline import SizeEstimationConfig
 
 INFERENCE_MODES = ("sam_only", "detector")
@@ -193,6 +195,28 @@ def build_parser():
         type=int,
         help="Optional maximum number of sampled video frames to process.",
     )
+    video.add_argument(
+        "--tracking-enabled",
+        action="store_true",
+        default=None,
+        help="Track masks between SAM refreshes instead of running SAM on every sampled "
+        "frame (default: env FRUIT_PIPELINE_TRACKING_ENABLED, currently false). Best for "
+        "fixed/near-fixed camera streams.",
+    )
+    video.add_argument(
+        "--sam-refresh-interval",
+        type=int,
+        default=None,
+        help="Sampled frames between SAM refresh runs when tracking is enabled "
+        "(default: env FRUIT_PIPELINE_SAM_REFRESH_INTERVAL, currently 30).",
+    )
+    video.add_argument(
+        "--tracker-type",
+        choices=TRACKER_TYPES,
+        default=None,
+        help="Tracker implementation used between SAM refreshes "
+        "(default: env FRUIT_PIPELINE_TRACKER_TYPE, currently optical_flow).",
+    )
     live = parser.add_argument_group("dashboard live reporting")
     live.add_argument("--live-job-dir", help="Dashboard job directory for live events and preview.")
     live.add_argument("--live-job-id", help="Dashboard job identifier used in live events.")
@@ -256,6 +280,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         debug=not args.no_size_debug,
         rectified_pixels_per_mm=args.rectified_pixels_per_mm,
     )
+    video_segmentation_kwargs = {}
+    if args.tracking_enabled is not None:
+        video_segmentation_kwargs["tracking_enabled"] = args.tracking_enabled
+    if args.sam_refresh_interval is not None:
+        video_segmentation_kwargs["sam_refresh_interval"] = args.sam_refresh_interval
+    if args.tracker_type is not None:
+        video_segmentation_kwargs["tracker_type"] = args.tracker_type
+
     config = IntegratedPipelineConfig(
         detection=detection_config,
         sam_only=sam_only_config,
@@ -271,6 +303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         input_rotation=args.input_rotation,
         reuse_pallet_selection=args.reuse_pallet_selection,
         min_pallet_overlap=args.min_pallet_overlap,
+        video_segmentation=VideoSegmentationConfig(**video_segmentation_kwargs),
     )
     reporter = None
     if args.live_job_dir or args.live_job_id:
