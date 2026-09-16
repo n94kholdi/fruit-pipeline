@@ -40,7 +40,9 @@ from fruit_pipeline.size_estimation.pipeline import (
     SizeEstimationConfig,
     SizeEstimationPipeline,
     SizeEstimationResult,
+    draw_measurement_overlay,
 )
+from fruit_pipeline.visualization.rendering import draw_overlays
 
 logger = logging.getLogger(__name__)
 
@@ -409,7 +411,6 @@ class IntegratedFruitSizingPipeline:
             ok = True
             stream_started = monotonic()
             last_interval_result: FrameResult | None = None
-            last_interval_preview: np.ndarray | None = None
             while ok:
                 if frame_index % self.config.frame_step == 0:
                     processing_frame = self._normalize_frame(frame)
@@ -448,8 +449,8 @@ class IntegratedFruitSizingPipeline:
                         timestamp_seconds=scheduler_seconds,
                     )
                     if interval_mode and not frame_timings.used_sam:
-                        if last_interval_result is None or last_interval_preview is None:
-                            raise RuntimeError("Static SAM preview is unavailable before the first SAM run")
+                        if last_interval_result is None:
+                            raise RuntimeError("Static SAM result is unavailable before the first SAM run")
                         preview_result = replace(
                             last_interval_result,
                             frame_index=frame_index,
@@ -461,7 +462,10 @@ class IntegratedFruitSizingPipeline:
                         )
                         self._notify_frame(
                             preview_result,
-                            last_interval_preview,
+                            self._render_interval_preview(
+                                processing_frame,
+                                last_interval_result,
+                            ),
                             len(frames),
                             None,
                         )
@@ -481,17 +485,13 @@ class IntegratedFruitSizingPipeline:
                         frames.append(frame_result)
                     if interval_mode:
                         last_interval_result = frame_result
-                        # Keep the exact pixels displayed for the SAM refresh
-                        # frame. Between refreshes the dashboard must show this
-                        # frozen segmentation result unchanged, rather than
-                        # redraw the cached masks over each new camera frame.
-                        refresh_preview = frame_result.sizing.debug_overlay
-                        last_interval_preview = (
-                            refresh_preview if refresh_preview is not None else processing_frame
-                        ).copy()
                     self._notify_frame(
                         frame_result,
-                        last_interval_preview if interval_mode else processing_frame,
+                        (
+                            self._render_interval_preview(processing_frame, frame_result)
+                            if interval_mode
+                            else processing_frame
+                        ),
                         len(frames),
                         total_sampled_frames,
                     )
@@ -505,6 +505,21 @@ class IntegratedFruitSizingPipeline:
         result = MediaResult(source, str(self.config.pallet_selection_path), frames)
         result.save(Path(self.config.output_dir) / f"{stem}_summary.json")
         return result
+
+    @staticmethod
+    def _render_interval_preview(
+        current_frame: np.ndarray,
+        sam_result: FrameResult,
+    ) -> np.ndarray:
+        """Render the latest SAM result over the current, changing video frame."""
+        if sam_result.sizing.debug_overlay is not None:
+            return draw_measurement_overlay(
+                current_frame,
+                sam_result.sizing.pallet_detection,
+                sam_result.instances,
+                sam_result.sizing.measurements,
+            )
+        return draw_overlays(current_frame, sam_result.instances)
 
     def _notify_frame(
         self,

@@ -212,9 +212,13 @@ def test_interval_video_records_only_sam_refresh_results_and_reuses_masks(tmp_pa
         (3, False, 2, None),
         (4, True, 3, None),
     ]
-    assert np.array_equal(published_previews[1], published_previews[0])
+    # The live background advances, while the latest SAM annotations remain
+    # plotted over it until the next refresh.
+    assert not np.array_equal(published_previews[1], published_previews[0])
+    assert not np.array_equal(published_previews[1], frames[1])
     assert not np.array_equal(published_previews[2], published_previews[1])
-    assert np.array_equal(published_previews[3], published_previews[2])
+    assert not np.array_equal(published_previews[3], published_previews[2])
+    assert not np.array_equal(published_previews[3], frames[3])
     assert not (tmp_path / "output/frames/frame_000001").exists()
     assert not (tmp_path / "output/frames/frame_000003").exists()
 
