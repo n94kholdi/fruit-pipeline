@@ -83,8 +83,21 @@ def test_fruit_job_runs_in_process_to_reuse_startup_model(tmp_path, monkeypatch)
     assert calls and calls[0][0:2] == ["--image", str(source)]
     assert calls[0][calls[0].index("--sam-checkpoint") + 1] == "/models/sam_vit_b_01ec64.pth"
     assert calls[0][calls[0].index("--sam-model-type") + 1] == "vit_b"
+    assert calls[0][calls[0].index("--static-mask-refresh-seconds") + 1] == "600"
     assert dashboard_api._job("job-in-process")["status"] == "completed"
     assert "job-in-process" not in dashboard_api.job_processes
+
+
+def test_interval_job_validation_is_bounded_to_one_hour():
+    import pytest
+    from pydantic import ValidationError
+
+    assert _fruit_job_request(inference_interval_minutes=1).inference_interval_minutes == 1
+    assert _fruit_job_request(inference_interval_minutes=60).inference_interval_minutes == 60
+    with pytest.raises(ValidationError):
+        _fruit_job_request(inference_interval_minutes=0)
+    with pytest.raises(ValidationError):
+        _fruit_job_request(inference_interval_minutes=61)
 
 
 def test_custom_pallet_dimensions_create_a_job_scoped_config(tmp_path):

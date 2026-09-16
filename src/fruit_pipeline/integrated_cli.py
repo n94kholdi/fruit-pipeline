@@ -217,6 +217,12 @@ def build_parser():
         help="Tracker implementation used between SAM refreshes "
         "(default: env FRUIT_PIPELINE_TRACKER_TYPE, currently optical_flow).",
     )
+    video.add_argument(
+        "--static-mask-refresh-seconds",
+        type=float,
+        help="Run SAM on the first frame and again after this many seconds of media/stream time; "
+        "reuse the exact masks between refreshes without tracking.",
+    )
     live = parser.add_argument_group("dashboard live reporting")
     live.add_argument("--live-job-dir", help="Dashboard job directory for live events and preview.")
     live.add_argument("--live-job-id", help="Dashboard job identifier used in live events.")
@@ -287,6 +293,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         video_segmentation_kwargs["sam_refresh_interval"] = args.sam_refresh_interval
     if args.tracker_type is not None:
         video_segmentation_kwargs["tracker_type"] = args.tracker_type
+    if args.static_mask_refresh_seconds is not None:
+        video_segmentation_kwargs["static_mask_refresh_seconds"] = args.static_mask_refresh_seconds
+        # The interval dashboard mode is explicitly tracker-free, even when a
+        # deployment has enabled the legacy tracker through environment vars.
+        video_segmentation_kwargs["tracking_enabled"] = False
 
     config = IntegratedPipelineConfig(
         detection=detection_config,
@@ -316,6 +327,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             return
         if (Path(args.live_job_dir) / "cancel.requested").is_file():
             raise InterruptedError("Fruit-analysis job cancellation requested")
+        measurements = frame_result.sizing.measurements
+        average_size = (
+            {
+                "width": sum(item.width_mm for item in measurements) / len(measurements),
+                "length": sum(item.length_mm for item in measurements) / len(measurements),
+                "equivalent_diameter": sum(
+                    item.equivalent_diameter_mm for item in measurements
+                ) / len(measurements),
+            }
+            if measurements
+            else None
+        )
         reporter.publish_frame(
             preview,
             frame_index=frame_result.frame_index,
@@ -324,6 +347,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             total_sampled_frames=total_count,
             num_fruits=frame_result.num_fruits,
             num_measured_fruits=len(frame_result.sizing.measurements),
+            inference_refreshed=frame_result.used_sam,
+            average_fruit_size_mm=average_size,
         )
 
     result = IntegratedFruitSizingPipeline(

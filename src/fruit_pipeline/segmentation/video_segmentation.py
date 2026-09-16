@@ -1,4 +1,4 @@
-"""Decide when to re-run SAM vs. reuse tracker-propagated masks for video.
+"""Decide when to re-run SAM and how masks are reused for video.
 
 Implements the refresh-interval + tracking design from
 ``prompt2_sam_optimzation.md`` (repo root): SAM remains the sole source of
@@ -42,12 +42,20 @@ class VideoSegmentationConfig:
     tracker_type: str = field(
         default_factory=lambda: os.getenv("FRUIT_PIPELINE_TRACKER_TYPE", "optical_flow")
     )
+    static_mask_refresh_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if self.sam_refresh_interval <= 0:
             raise ValueError("sam_refresh_interval must be positive")
         if self.tracker_type not in TRACKER_TYPES:
             raise ValueError(f"tracker_type must be one of {TRACKER_TYPES}")
+        if (
+            self.static_mask_refresh_seconds is not None
+            and self.static_mask_refresh_seconds <= 0
+        ):
+            raise ValueError("static_mask_refresh_seconds must be positive")
+        if self.static_mask_refresh_seconds is not None and self.tracking_enabled:
+            raise ValueError("static mask reuse and tracking cannot be enabled together")
 
 
 @dataclass
@@ -77,11 +85,15 @@ class VideoSegmentationManager:
         )
         self._sample_index = 0
         self._has_state = False
+        self._static_instances: list[FruitInstance] = []
+        self._last_sam_timestamp_seconds: float | None = None
 
     def process(
         self,
         frame_bgr: np.ndarray,
         run_sam: Callable[[], list[FruitInstance]],
+        *,
+        timestamp_seconds: float | None = None,
     ) -> tuple[list[FruitInstance], VideoFrameTimings]:
         """Return this frame's instances, calling ``run_sam`` only when needed.
 
@@ -93,21 +105,43 @@ class VideoSegmentationManager:
         index = self._sample_index
         self._sample_index += 1
 
-        needs_sam = (
-            not self.config.tracking_enabled
-            or not self._has_state
-            or index % self.config.sam_refresh_interval == 0
-        )
+        static_interval = self.config.static_mask_refresh_seconds
+        if static_interval is not None:
+            if timestamp_seconds is None:
+                raise ValueError("timestamp_seconds is required for static mask reuse")
+            needs_sam = (
+                not self._has_state
+                or self._last_sam_timestamp_seconds is None
+                or timestamp_seconds - self._last_sam_timestamp_seconds >= static_interval
+                # A timestamp reset means a new/restarted media timeline.
+                or timestamp_seconds < self._last_sam_timestamp_seconds
+            )
+        else:
+            needs_sam = (
+                not self.config.tracking_enabled
+                or not self._has_state
+                or index % self.config.sam_refresh_interval == 0
+            )
 
         if needs_sam:
             started = time.perf_counter()
             instances = run_sam()
             sam_ms = (time.perf_counter() - started) * 1000.0
-            if self.config.tracking_enabled:
+            if static_interval is not None:
+                self._static_instances = instances
+                self._last_sam_timestamp_seconds = timestamp_seconds
+                self._has_state = True
+            elif self.config.tracking_enabled:
                 assert self._tracker is not None
                 self._tracker.initialize(frame_bgr, instances)
                 self._has_state = True
             timings = VideoFrameTimings(used_sam=True, sam_ms=sam_ms)
+        elif static_interval is not None:
+            # Deliberately keep masks at their last SAM coordinates. This mode
+            # is for fixed cameras and mostly stationary fruit; no optical flow
+            # or other tracker is run between inference timestamps.
+            instances = self._static_instances
+            timings = VideoFrameTimings(used_sam=False)
         else:
             assert self._tracker is not None
             started = time.perf_counter()
@@ -118,7 +152,13 @@ class VideoSegmentationManager:
         logger.info(
             "Video frame %d: %s (sam=%.1fms, tracking=%.1fms, total=%.1fms, instances=%d)",
             index,
-            "SAM refresh" if timings.used_sam else "tracked",
+            (
+                "SAM refresh"
+                if timings.used_sam
+                else "reused static masks"
+                if static_interval is not None
+                else "tracked"
+            ),
             timings.sam_ms,
             timings.tracking_ms,
             timings.total_ms,

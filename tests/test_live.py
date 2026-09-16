@@ -55,3 +55,34 @@ def test_terminal_event_preserves_latest_preview_and_metrics(tmp_path):
     assert completed["preview_reference"] == "/api/v1/jobs/fruit-job/preview"
     assert completed["frame_index"] == 20
     assert completed["metrics"]["num_fruits"] == 5
+
+
+def test_cached_mask_preview_keeps_last_refresh_totals_and_reports_sizes(tmp_path):
+    reporter = FruitLiveReporter(tmp_path, "fruit-job")
+    frame = np.zeros((20, 20, 3), np.uint8)
+    reporter.publish_frame(
+        frame,
+        frame_index=0,
+        timestamp_ms=0.0,
+        processed_frame_count=1,
+        total_sampled_frames=None,
+        num_fruits=5,
+        num_measured_fruits=4,
+        average_fruit_size_mm={"width": 31.5, "length": 35.0, "equivalent_diameter": 33.0},
+    )
+
+    cached = reporter.publish_frame(
+        frame,
+        frame_index=10,
+        timestamp_ms=400.0,
+        processed_frame_count=1,
+        total_sampled_frames=None,
+        num_fruits=5,
+        num_measured_fruits=4,
+        inference_refreshed=False,
+        average_fruit_size_mm={"width": 31.5, "length": 35.0, "equivalent_diameter": 33.0},
+    )
+
+    assert cached["metrics"]["total_fruit_observations"] == 5
+    assert cached["metrics"]["inference_refreshed"] is False
+    assert cached["metrics"]["average_fruit_size_mm"]["width"] == 31.5

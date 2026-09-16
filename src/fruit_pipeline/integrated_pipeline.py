@@ -11,6 +11,7 @@ import json
 import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from time import monotonic
 from typing import Callable
 from urllib.parse import urlsplit
 
@@ -40,6 +41,7 @@ from fruit_pipeline.size_estimation.pipeline import (
     SizeEstimationPipeline,
     SizeEstimationResult,
 )
+from fruit_pipeline.visualization.rendering import draw_overlays
 
 logger = logging.getLogger(__name__)
 
@@ -369,12 +371,14 @@ class IntegratedFruitSizingPipeline:
 
     def run_video(self, video_path: str | Path) -> MediaResult:
         source = str(video_path)
+        is_live_stream = "://" in source
         stem = media_source_stem(source)
         capture = cv2.VideoCapture(source)
         if not capture.isOpened():
             raise FileNotFoundError(f"Cannot open video or stream: {source}")
 
         frames: list[FrameResult] = []
+        interval_mode = self.config.video_segmentation.static_mask_refresh_seconds is not None
         self._video_segmentation_manager = VideoSegmentationManager(self.config.video_segmentation)
         try:
             ok, first_frame = capture.read()
@@ -396,36 +400,87 @@ class IntegratedFruitSizingPipeline:
             )
             if total_sampled_frames is not None and self.config.max_frames is not None:
                 total_sampled_frames = min(total_sampled_frames, self.config.max_frames)
+            if interval_mode:
+                # Interval results count SAM refreshes, not the lightweight
+                # previews that reuse the preceding masks.
+                total_sampled_frames = None
 
             frame_index = 0
             frame = first_frame
             ok = True
+            stream_started = monotonic()
+            last_interval_result: FrameResult | None = None
             while ok:
                 if frame_index % self.config.frame_step == 0:
                     processing_frame = self._normalize_frame(frame)
+                    timestamp_ms = _finite_float_or_none(capture.get(cv2.CAP_PROP_POS_MSEC))
+                    scheduler_seconds = (
+                        monotonic() - stream_started
+                        if is_live_stream
+                        else (timestamp_ms or 0.0) / 1000.0
+                    )
                     artifact_dir = (
                         Path(self.config.output_dir)
                         / "frames"
                         / f"frame_{frame_index:06d}"
                     )
-                    artifact_dir.mkdir(parents=True, exist_ok=True)
                     frame_path = artifact_dir / f"{stem}_frame_{frame_index:06d}.jpg"
-                    if not cv2.imwrite(str(frame_path), processing_frame):
-                        raise OSError(f"Cannot write sampled frame: {frame_path}")
+
+                    def discover_current_frame() -> list[FruitInstance]:
+                        artifact_dir.mkdir(parents=True, exist_ok=True)
+                        if not cv2.imwrite(str(frame_path), processing_frame):
+                            raise OSError(f"Cannot write sampled frame: {frame_path}")
+                        return self._discover_instances(frame_path, artifact_dir)
+
+                    # Preserve the legacy artifact contract. Interval mode only
+                    # writes a frame when the manager actually requests SAM.
+                    if not interval_mode:
+                        artifact_dir.mkdir(parents=True, exist_ok=True)
+                        if not cv2.imwrite(str(frame_path), processing_frame):
+                            raise OSError(f"Cannot write sampled frame: {frame_path}")
                     full_image_instances, frame_timings = self._video_segmentation_manager.process(
                         processing_frame,
-                        run_sam=lambda: self._discover_instances(frame_path, artifact_dir),
+                        run_sam=(
+                            discover_current_frame
+                            if interval_mode
+                            else lambda: self._discover_instances(frame_path, artifact_dir)
+                        ),
+                        timestamp_seconds=scheduler_seconds,
                     )
+                    if interval_mode and not frame_timings.used_sam:
+                        if last_interval_result is None:
+                            raise RuntimeError("Static masks are unavailable before the first SAM run")
+                        preview_result = replace(
+                            last_interval_result,
+                            frame_index=frame_index,
+                            timestamp_ms=timestamp_ms,
+                            sizing=replace(last_interval_result.sizing, debug_overlay=None),
+                            used_sam=False,
+                            sam_ms=0.0,
+                            tracking_ms=0.0,
+                        )
+                        self._notify_frame(
+                            preview_result,
+                            draw_overlays(processing_frame, full_image_instances),
+                            len(frames),
+                            None,
+                        )
+                        ok, frame = capture.read()
+                        frame_index += 1
+                        continue
                     frame_result = self._process_frame(
                         processing_frame,
                         frame_path,
                         frame_index,
-                        _finite_float_or_none(capture.get(cv2.CAP_PROP_POS_MSEC)),
+                        timestamp_ms,
                         artifact_dir,
                         full_image_instances=full_image_instances,
                         frame_timings=frame_timings,
                     )
-                    frames.append(frame_result)
+                    if not interval_mode or frame_result.used_sam:
+                        frames.append(frame_result)
+                    if interval_mode:
+                        last_interval_result = frame_result
                     self._notify_frame(
                         frame_result,
                         processing_frame,
