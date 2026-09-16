@@ -46,6 +46,7 @@ class FruitLiveReporter:
         num_measured_fruits: int,
         inference_refreshed: bool = True,
         average_fruit_size_mm: Mapping[str, float] | None = None,
+        fruits: list[Mapping[str, object]] | None = None,
     ) -> dict[str, object]:
         if inference_refreshed:
             self.total_fruit_observations += num_fruits
@@ -73,6 +74,9 @@ class FruitLiveReporter:
                     dict(average_fruit_size_mm)
                     if average_fruit_size_mm is not None
                     else None
+                ),
+                "fruits": (
+                    [dict(item) for item in fruits] if fruits is not None else []
                 ),
             },
         )

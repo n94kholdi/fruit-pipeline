@@ -349,6 +349,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             num_measured_fruits=len(frame_result.sizing.measurements),
             inference_refreshed=frame_result.used_sam,
             average_fruit_size_mm=average_size,
+            fruits=[item.to_dict() for item in measurements],
         )
 
     result = IntegratedFruitSizingPipeline(
