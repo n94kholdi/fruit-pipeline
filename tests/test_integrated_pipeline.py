@@ -150,16 +150,19 @@ def test_video_pipeline_processes_every_tenth_frame(tmp_path, monkeypatch):
 def test_interval_video_records_only_sam_refresh_results_and_reuses_masks(tmp_path, monkeypatch):
     video_path = tmp_path / "fruit.mp4"
     video_path.touch()
+    base_config = _config(tmp_path, video_path, frame_step=1)
     config = replace(
-        _config(tmp_path, video_path, frame_step=1),
+        base_config,
+        sizing=replace(base_config.sizing, debug=True),
         video_segmentation=VideoSegmentationConfig(
             tracking_enabled=False,
             static_mask_refresh_seconds=60,
         ),
     )
-    frames = [np.zeros((240, 160, 3), np.uint8) for _ in range(5)]
+    frames = [np.full((240, 160, 3), index * 20, np.uint8) for index in range(5)]
     detection_calls = []
     published = []
+    published_previews = []
 
     class FakeCapture:
         def __init__(self, _path):
@@ -188,14 +191,16 @@ def test_interval_video_records_only_sam_refresh_results_and_reuses_masks(tmp_pa
         detection_calls.append(config.image_path)
         return _fake_detection_runner(config, detector, sam_predictor)
 
+    def publish(result, preview, processed, total):
+        published.append((result.frame_index, result.used_sam, processed, total))
+        published_previews.append(preview.copy())
+
     monkeypatch.setattr("fruit_pipeline.integrated_pipeline.cv2.VideoCapture", FakeCapture)
     result = IntegratedFruitSizingPipeline(
         config,
         model_loader=lambda _config: (object(), object()),
         detection_runner=detect,
-        frame_processed=lambda result, _preview, processed, total: published.append(
-            (result.frame_index, result.used_sam, processed, total)
-        ),
+        frame_processed=publish,
     ).run(video_path)
 
     assert [frame.frame_index for frame in result.frames] == [0, 2, 4]
@@ -207,6 +212,9 @@ def test_interval_video_records_only_sam_refresh_results_and_reuses_masks(tmp_pa
         (3, False, 2, None),
         (4, True, 3, None),
     ]
+    assert np.array_equal(published_previews[1], published_previews[0])
+    assert not np.array_equal(published_previews[2], published_previews[1])
+    assert np.array_equal(published_previews[3], published_previews[2])
     assert not (tmp_path / "output/frames/frame_000001").exists()
     assert not (tmp_path / "output/frames/frame_000003").exists()
 
