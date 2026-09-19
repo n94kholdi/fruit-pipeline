@@ -116,7 +116,11 @@ class SizeEstimationPipeline:
             except PalletGeometryError as exc:
                 logger.warning("Skipping unmeasurable fruit %s: %s", fruit.instance_id, exc)
 
-        overlay = _draw_debug(image_bgr, detection, fruit_list, measurements) if self.config.debug else None
+        overlay = (
+            draw_measurement_overlay(image_bgr, detection, fruit_list, measurements)
+            if self.config.debug
+            else None
+        )
         rectified = (
             rectify_pallet(
                 cv2.undistort(
@@ -130,10 +134,11 @@ class SizeEstimationPipeline:
         return SizeEstimationResult(calibration, detection, homography, measurements, overlay, rectified)
 
 
-def _draw_debug(
+def draw_measurement_overlay(
     image_bgr: np.ndarray, detection: PalletDetection,
     fruits: list[SegmentedFruit], measurements: list[FruitMeasurement],
 ) -> np.ndarray:
+    """Draw the sizing/SAM annotations over an arbitrary current video frame."""
     canvas = image_bgr.copy()
     tint = np.zeros_like(canvas)
     for fruit in fruits:

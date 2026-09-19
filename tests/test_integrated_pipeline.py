@@ -19,6 +19,7 @@ from fruit_pipeline.integrated_pipeline import (
 from fruit_pipeline.pallet_geometry.detector import ManualPalletDetector
 from fruit_pipeline.pipeline import PipelineConfig
 from fruit_pipeline.segmentation.sam import FruitInstance
+from fruit_pipeline.segmentation.video_segmentation import VideoSegmentationConfig
 from fruit_pipeline.size_estimation.pipeline import SizeEstimationConfig
 
 
@@ -144,6 +145,82 @@ def test_video_pipeline_processes_every_tenth_frame(tmp_path, monkeypatch):
     ]
     assert (tmp_path / "output/fruit_summary.json").is_file()
     assert (tmp_path / "output/frames/frame_000020/fruit_frame_000020_result.json").is_file()
+
+
+def test_interval_video_records_only_sam_refresh_results_and_reuses_masks(tmp_path, monkeypatch):
+    video_path = tmp_path / "fruit.mp4"
+    video_path.touch()
+    base_config = _config(tmp_path, video_path, frame_step=1)
+    config = replace(
+        base_config,
+        sizing=replace(base_config.sizing, debug=True),
+        video_segmentation=VideoSegmentationConfig(
+            tracking_enabled=False,
+            static_mask_refresh_seconds=60,
+        ),
+    )
+    frames = [np.full((240, 160, 3), index * 20, np.uint8) for index in range(5)]
+    detection_calls = []
+    published = []
+    published_previews = []
+
+    class FakeCapture:
+        def __init__(self, _path):
+            self.index = 0
+            self.last_read = -1
+
+        def isOpened(self):
+            return True
+
+        def read(self):
+            if self.index >= len(frames):
+                return False, None
+            self.last_read = self.index
+            self.index += 1
+            return True, frames[self.last_read]
+
+        def get(self, property_id):
+            if property_id == cv2.CAP_PROP_FRAME_COUNT:
+                return len(frames)
+            return self.last_read * 30_000.0
+
+        def release(self):
+            pass
+
+    def detect(config, detector, sam_predictor):
+        detection_calls.append(config.image_path)
+        return _fake_detection_runner(config, detector, sam_predictor)
+
+    def publish(result, preview, processed, total):
+        published.append((result.frame_index, result.used_sam, processed, total))
+        published_previews.append(preview.copy())
+
+    monkeypatch.setattr("fruit_pipeline.integrated_pipeline.cv2.VideoCapture", FakeCapture)
+    result = IntegratedFruitSizingPipeline(
+        config,
+        model_loader=lambda _config: (object(), object()),
+        detection_runner=detect,
+        frame_processed=publish,
+    ).run(video_path)
+
+    assert [frame.frame_index for frame in result.frames] == [0, 2, 4]
+    assert len(detection_calls) == 3
+    assert published == [
+        (0, True, 1, None),
+        (1, False, 1, None),
+        (2, True, 2, None),
+        (3, False, 2, None),
+        (4, True, 3, None),
+    ]
+    # The live background advances, while the latest SAM annotations remain
+    # plotted over it until the next refresh.
+    assert not np.array_equal(published_previews[1], published_previews[0])
+    assert not np.array_equal(published_previews[1], frames[1])
+    assert not np.array_equal(published_previews[2], published_previews[1])
+    assert not np.array_equal(published_previews[3], published_previews[2])
+    assert not np.array_equal(published_previews[3], frames[3])
+    assert not (tmp_path / "output/frames/frame_000001").exists()
+    assert not (tmp_path / "output/frames/frame_000003").exists()
 
 
 def test_live_stream_url_is_preserved_and_uses_safe_artifact_names(tmp_path, monkeypatch):

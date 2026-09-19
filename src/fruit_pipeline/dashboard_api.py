@@ -111,6 +111,11 @@ class FruitJobRequest(BaseModel):
     resize_to_calibration: bool = True
     allow_unsafe_resize: bool = False
     max_frames: int | None = Field(default=None, ge=1)
+    # The current dashboard uses interval mode: SAM-only inference at a
+    # user-selected timestamp, with static masks between runs. Legacy preserves
+    # the former detector/tracker-oriented controls for an opt-in rollback.
+    processing_mode: Literal["interval", "legacy"] = "interval"
+    inference_interval_minutes: int = Field(default=10, ge=1, le=60)
     # "sam_only" (default): no detector -- SAM's own automatic mask generator
     # proposes and segments every fruit. "detector": the original detector +
     # box-prompted-SAM pipeline.
@@ -422,6 +427,7 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
         encoding="utf-8",
     )
     pallet_config = _pallet_config_for_job(job_dir, request)
+    inference_mode = "sam_only" if request.processing_mode == "interval" else request.inference_mode
     command = [
         sys.executable, "-m", "fruit_pipeline.integrated_cli",
         "--image", str(source),
@@ -437,12 +443,17 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
         "--sam-checkpoint", SAM_CHECKPOINT,
         "--sam-model-type", SAM_MODEL_TYPE,
         "--device", DEVICE,
-        "--inference-mode", request.inference_mode,
+        "--inference-mode", inference_mode,
         "--live-job-dir", str(job_dir),
         "--live-job-id", job_id,
         "-v",
     ]
-    if request.inference_mode == "detector":
+    if request.processing_mode == "interval":
+        command += [
+            "--static-mask-refresh-seconds",
+            str(request.inference_interval_minutes * 60),
+        ]
+    if inference_mode == "detector":
         command += [
             "--detector-weights", DETECTOR_WEIGHTS,
             "--sam-batch-size", "1",
@@ -498,7 +509,7 @@ def health() -> dict[str, object]:
     sam_exists = Path(SAM_CHECKPOINT).is_file()
     return {
         "status": "ok",
-        "models_ready": detector_exists and sam_exists,
+        "models_ready": sam_exists,
         "models": {
             "detector": detector_exists,
             "sam": sam_exists,
@@ -712,8 +723,13 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
     except CalibrationError as exc:
         raise HTTPException(404, str(exc)) from exc
     _validate_requested_pallet(request)
+    effective_inference_mode = (
+        "sam_only" if request.processing_mode == "interval" else request.inference_mode
+    )
     required_models = (
-        (SAM_CHECKPOINT,) if request.inference_mode == "sam_only" else (DETECTOR_WEIGHTS, SAM_CHECKPOINT)
+        (SAM_CHECKPOINT,)
+        if effective_inference_mode == "sam_only"
+        else (DETECTOR_WEIGHTS, SAM_CHECKPOINT)
     )
     missing_models = [path for path in required_models if not Path(path).is_file()]
     if missing_models:
@@ -722,7 +738,11 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
             "Required model files are not mounted: " + ", ".join(missing_models),
         )
     request.camera_id = camera_id
-    if source_type == "stream" and request.max_frames is None:
+    if (
+        source_type == "stream"
+        and request.processing_mode == "legacy"
+        and request.max_frames is None
+    ):
         request.max_frames = 100
     job_id = uuid.uuid4().hex
     _write_job(
@@ -734,6 +754,12 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
         pallet_type=request.pallet_type,
         pallet_width_mm=request.pallet_width_mm,
         pallet_length_mm=request.pallet_length_mm,
+        processing_mode=request.processing_mode,
+        inference_interval_minutes=(
+            request.inference_interval_minutes
+            if request.processing_mode == "interval"
+            else None
+        ),
     )
     future = executor.submit(_run_fruit_job, job_id, request, sources[0])
     with jobs_lock:

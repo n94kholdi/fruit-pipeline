@@ -54,9 +54,46 @@ def test_tracking_enabled_refreshes_only_at_interval(monkeypatch):
     assert len(sam_calls) == 3
 
 
+def test_static_masks_are_reused_until_elapsed_time_reaches_refresh_interval():
+    config = VideoSegmentationConfig(
+        tracking_enabled=False,
+        static_mask_refresh_seconds=600,
+    )
+    manager = VideoSegmentationManager(config)
+    frame = np.zeros((40, 40, 3), dtype=np.uint8)
+    sam_calls = []
+
+    def run_sam():
+        instance = _instance(len(sam_calls) + 1)
+        sam_calls.append(instance)
+        return [instance]
+
+    outputs = [
+        manager.process(frame, run_sam=run_sam, timestamp_seconds=timestamp)
+        for timestamp in (0, 120, 599, 600, 1199, 1200)
+    ]
+
+    assert [timings.used_sam for _, timings in outputs] == [
+        True, False, False, True, False, True,
+    ]
+    assert [instances[0].instance_id for instances, _ in outputs] == [1, 1, 1, 2, 2, 3]
+    assert len(sam_calls) == 3
+
+
+def test_static_mask_mode_rejects_tracking():
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        VideoSegmentationConfig(
+            tracking_enabled=True,
+            static_mask_refresh_seconds=60,
+        )
+
+
 def test_refresh_interval_must_be_positive():
     with pytest.raises(ValueError, match="sam_refresh_interval"):
         VideoSegmentationConfig(sam_refresh_interval=0)
+
+    with pytest.raises(ValueError, match="static_mask_refresh_seconds"):
+        VideoSegmentationConfig(static_mask_refresh_seconds=0)
 
 
 def test_unknown_tracker_type_rejected():

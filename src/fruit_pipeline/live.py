@@ -44,8 +44,12 @@ class FruitLiveReporter:
         total_sampled_frames: int | None,
         num_fruits: int,
         num_measured_fruits: int,
+        inference_refreshed: bool = True,
+        average_fruit_size_mm: Mapping[str, float] | None = None,
+        fruits: list[Mapping[str, object]] | None = None,
     ) -> dict[str, object]:
-        self.total_fruit_observations += num_fruits
+        if inference_refreshed:
+            self.total_fruit_observations += num_fruits
         preview_reference = self._write_preview(frame)
         progress = (
             min(100.0, processed_frame_count * 100.0 / total_sampled_frames)
@@ -65,6 +69,15 @@ class FruitLiveReporter:
                 "num_fruits": num_fruits,
                 "num_measured_fruits": num_measured_fruits,
                 "total_fruit_observations": self.total_fruit_observations,
+                "inference_refreshed": inference_refreshed,
+                "average_fruit_size_mm": (
+                    dict(average_fruit_size_mm)
+                    if average_fruit_size_mm is not None
+                    else None
+                ),
+                "fruits": (
+                    [dict(item) for item in fruits] if fruits is not None else []
+                ),
             },
         )
 
