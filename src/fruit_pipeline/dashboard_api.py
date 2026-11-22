@@ -50,7 +50,7 @@ SAM_MODEL_TYPE = os.getenv("FRUIT_PIPELINE_SAM_MODEL_TYPE", "vit_l")
 SAM_USE_FP16 = env_flag("FRUIT_PIPELINE_SAM_USE_FP16", True)
 SAM_USE_COMPILE = env_flag("FRUIT_PIPELINE_SAM_TORCH_COMPILE", False)
 SAM_USE_SDPA_ATTENTION = env_flag("FRUIT_PIPELINE_SAM_SDPA_ATTENTION", False)
-SAM_PRELOAD = env_flag("FRUIT_PIPELINE_PRELOAD", True)
+SAM_PRELOAD = env_flag("FRUIT_PIPELINE_PRELOAD", False)
 SAM_AUTO_RELEASE_GPU = env_flag("FRUIT_PIPELINE_AUTO_RELEASE_GPU", True)
 MAX_UPLOAD_BYTES = int(os.getenv("FRUIT_PIPELINE_MAX_UPLOAD_BYTES", str(1024**3)))
 WORKERS = max(1, int(os.getenv("FRUIT_PIPELINE_JOB_WORKERS", "1")))
@@ -524,6 +524,17 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
             unloaded = clear_sam_model_cache()
             if unloaded:
                 logger.info("Released %d SAM model instance(s) after job %s", unloaded, job_id)
+        try:
+            import gc
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
 
 @app.post("/api/v1/gpu/release")

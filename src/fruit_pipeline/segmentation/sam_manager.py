@@ -239,12 +239,27 @@ class SAMModelManager:
 
     def unload_model(self) -> bool:
         """Release the SAM model from memory and empty the CUDA cache."""
+        import gc
+
         with self._load_lock, self._inference_lock:
             was_loaded = self._model is not None
+            if self._predictor is not None:
+                try:
+                    self._predictor.reset_image()
+                except Exception:
+                    pass
+            if self._model is not None:
+                try:
+                    self._model.to("cpu")
+                except Exception:
+                    pass
             self._predictor = None
             self._model = None
+            gc.collect()
             if self.device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
                 torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
             return was_loaded
 
     def get_model(self):
