@@ -172,7 +172,32 @@ def test_result_payload_exposes_average_and_overlay(tmp_path, monkeypatch):
     result = dashboard_api._result_payload(job_id, output, source)
 
     assert result["total_fruit_observations"] == 2
+    assert result["job_id"] == job_id
     assert result["frames"][0]["measurement_overlay_url"].endswith("fruit_measurement_debug.png")
+
+
+def test_release_gpu_memory_endpoint_unloads_models_when_no_job_is_active(monkeypatch):
+    with dashboard_api.jobs_lock:
+        dashboard_api.jobs.clear()
+    monkeypatch.setattr(dashboard_api, "clear_sam_model_cache", lambda: 1)
+
+    response = dashboard_api.release_gpu_memory()
+
+    assert response == {"data": {"released": True, "unloaded_models": 1}}
+
+
+def test_release_gpu_memory_endpoint_rejects_when_job_is_running(tmp_path, monkeypatch):
+    import pytest
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(dashboard_api, "JOB_DIR", tmp_path)
+    with dashboard_api.jobs_lock:
+        dashboard_api.jobs.clear()
+    dashboard_api._write_job("active-job", status="running")
+
+    with pytest.raises(HTTPException) as exc_info:
+        dashboard_api.release_gpu_memory()
+    assert exc_info.value.status_code == 409
 
 
 def test_safe_name_rejects_path_segments():

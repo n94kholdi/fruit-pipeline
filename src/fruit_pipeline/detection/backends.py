@@ -30,12 +30,25 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 
+from typing import TYPE_CHECKING
+
 import numpy as np
-from sahi.annotation import Category
-from sahi.auto_model import AutoDetectionModel
-from sahi.models.base import DetectionModel
-from sahi.predict import get_prediction
-from sahi.prediction import ObjectPrediction
+
+if TYPE_CHECKING:
+    from sahi.annotation import Category
+    from sahi.auto_model import AutoDetectionModel
+    from sahi.models.base import DetectionModel
+    from sahi.predict import get_prediction
+    from sahi.prediction import ObjectPrediction
+else:
+    try:
+        from sahi.annotation import Category
+        from sahi.auto_model import AutoDetectionModel
+        from sahi.models.base import DetectionModel
+        from sahi.predict import get_prediction
+        from sahi.prediction import ObjectPrediction
+    except ImportError:
+        Category = AutoDetectionModel = DetectionModel = get_prediction = ObjectPrediction = object
 
 from fruit_pipeline.utils.paths import resolve_model_path
 

@@ -16,9 +16,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from sahi.prediction import ObjectPrediction
-from sahi.slicing import slice_image
-from sahi.utils.cv import read_image_as_pil
+
+try:
+    from sahi.prediction import ObjectPrediction
+    from sahi.slicing import slice_image
+    from sahi.utils.cv import read_image_as_pil
+except ImportError:
+    ObjectPrediction = slice_image = read_image_as_pil = object
 
 from fruit_pipeline.detection.backends import DetectorBackend, _relabel_class_agnostic, load_detector_backend
 

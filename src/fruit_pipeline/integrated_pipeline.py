@@ -25,7 +25,7 @@ from fruit_pipeline.pallet_geometry.detector import (
     PalletDetector,
     PalletGeometryError,
 )
-from fruit_pipeline.pipeline import PipelineConfig, load_models, run_pipeline
+from fruit_pipeline.pipeline import PipelineConfig, load_models, mask_to_polygons, run_pipeline
 from fruit_pipeline.sam_only_pipeline import SamOnlyConfig
 from fruit_pipeline.sam_only_pipeline import load_models as load_sam_only_models
 from fruit_pipeline.sam_only_pipeline import run_sam_only_pipeline
@@ -123,22 +123,44 @@ class FrameResult:
 
     def to_dict(self) -> dict[str, object]:
         measurements = {item.fruit_id: item for item in self.sizing.measurements}
+        corners_px = [
+            [round(float(point[0]), 2), round(float(point[1]), 2)]
+            for point in self.sizing.pallet_detection.corners_px
+        ]
+        height, width = (int(value) for value in self.sizing.calibration.resolution[::-1])
+        if self.instances:
+            mask_shape = np.asarray(self.instances[0].mask).shape
+            if len(mask_shape) == 2:
+                height, width = int(mask_shape[0]), int(mask_shape[1])
+        frame_id = (
+            f"frame_{self.frame_index:06d}"
+            if self.frame_index is not None
+            else Path(self.source_image).stem
+        )
         return {
+            "frame_id": frame_id,
             "source_image": self.source_image,
             "frame_index": self.frame_index,
             "timestamp_ms": self.timestamp_ms,
+            "image_width": width,
+            "image_height": height,
             "num_fruits": self.num_fruits,
             "full_image_num_fruits": self.full_image_num_fruits,
             "num_measured_fruits": len(measurements),
             "measurement_mode": self.sizing.measurement_mode,
             "pallet_type": self.sizing.pallet_detection.pallet_type,
             "pallet_confidence": self.sizing.pallet_detection.confidence,
+            "pallet_polygon": corners_px,
             "artifact_dir": self.artifact_dir,
             "used_sam": self.used_sam,
             "sam_ms": round(self.sam_ms, 2),
             "tracking_ms": round(self.tracking_ms, 2),
             "fruits": [
-                _fruit_record(instance, measurements.get(instance.instance_id))
+                _fruit_record(
+                    instance,
+                    measurements.get(instance.instance_id),
+                    pallet_corners_px=self.sizing.pallet_detection.corners_px,
+                )
                 for instance in self.instances
             ],
         }
@@ -173,9 +195,19 @@ class MediaResult:
         }
 
     def to_dict(self) -> dict[str, object]:
+        pallet_polygon = (
+            [
+                [round(float(point[0]), 2), round(float(point[1]), 2)]
+                for point in self.frames[0].sizing.pallet_detection.corners_px
+            ]
+            if self.frames
+            else []
+        )
         return {
+            "contract_version": 1,
             "source": self.source,
             "pallet_selection_path": self.pallet_selection_path,
+            "pallet_polygon": pallet_polygon,
             "processed_frame_count": len(self.frames),
             "total_fruit_observations": self.num_fruits,
             "average_fruit_size_mm": self.average_size_mm,
@@ -193,11 +225,28 @@ class MediaResult:
 
 
 def _fruit_record(
-    instance: FruitInstance, measurement: FruitMeasurement | None
+    instance: FruitInstance,
+    measurement: FruitMeasurement | None,
+    *,
+    pallet_corners_px: np.ndarray | None = None,
 ) -> dict[str, object]:
+    mask_bool = np.asarray(instance.mask, dtype=bool)
+    mask_area = int(mask_bool.sum())
+    pallet_overlap: float | None = None
+    inside_pallet = True
+    if pallet_corners_px is not None and mask_bool.ndim == 2 and mask_area > 0:
+        pallet_mask = np.zeros(mask_bool.shape, dtype=np.uint8)
+        cv2.fillConvexPoly(pallet_mask, np.round(pallet_corners_px).astype(np.int32), 1)
+        overlap = int(np.count_nonzero(mask_bool & pallet_mask.astype(bool))) / mask_area
+        pallet_overlap = round(float(overlap), 4)
+        inside_pallet = overlap > 0.0
     return {
         "fruit_id": instance.instance_id,
         "box": [round(float(value), 2) for value in instance.box],
+        "mask_polygon": mask_to_polygons(mask_bool),
+        "mask_area": mask_area,
+        "inside_pallet": inside_pallet,
+        "pallet_overlap": pallet_overlap,
         "category_name": instance.category_name,
         "detector_score": round(float(instance.detector_score), 4),
         "sam_score": round(float(instance.sam_score), 4),
@@ -360,6 +409,16 @@ class IntegratedFruitSizingPipeline:
             processing_path = input_dir / f"{path.stem}.png"
             if not cv2.imwrite(str(processing_path), image):
                 raise OSError(f"Cannot write normalized input: {processing_path}")
+        else:
+            output_root = Path(self.config.output_dir).resolve()
+            try:
+                path.resolve().relative_to(output_root)
+            except ValueError:
+                input_dir = output_root / "normalized_inputs"
+                input_dir.mkdir(parents=True, exist_ok=True)
+                processing_path = input_dir / path.name
+                if not cv2.imwrite(str(processing_path), image):
+                    raise OSError(f"Cannot write normalized input: {processing_path}")
         self.prepare_pallet(image)
         self._ensure_models(str(processing_path))
         frame = self._process_frame(

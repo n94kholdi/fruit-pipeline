@@ -46,8 +46,12 @@ import logging
 from dataclasses import dataclass, field
 
 import numpy as np
-from sahi.postprocess.combine import GreedyNMMPostprocess, NMMPostprocess
-from sahi.prediction import ObjectPrediction
+
+try:
+    from sahi.postprocess.combine import GreedyNMMPostprocess, NMMPostprocess
+    from sahi.prediction import ObjectPrediction
+except ImportError:
+    GreedyNMMPostprocess = NMMPostprocess = ObjectPrediction = object
 
 from fruit_pipeline.utils.geometry import (
     box_area,

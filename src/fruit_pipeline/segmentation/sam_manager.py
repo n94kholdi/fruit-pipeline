@@ -237,6 +237,16 @@ class SAMModelManager:
         logger.info("torch.compile enabled for SAM image_encoder (mode=%s)", self.compile_mode)
         return True
 
+    def unload_model(self) -> bool:
+        """Release the SAM model from memory and empty the CUDA cache."""
+        with self._load_lock, self._inference_lock:
+            was_loaded = self._model is not None
+            self._predictor = None
+            self._model = None
+            if self.device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return was_loaded
+
     def get_model(self):
         return self.load_model()
 
@@ -433,7 +443,15 @@ def get_sam_model_manager(
     return manager
 
 
-def clear_sam_model_cache() -> None:
-    """Clear manager references (primarily useful for tests and controlled refreshes)."""
+def clear_sam_model_cache() -> int:
+    """Unload all cached managers from GPU/CPU memory and clear references."""
+    import gc
+
     with _MANAGERS_LOCK:
+        managers = list(_MANAGERS.values())
         _MANAGERS.clear()
+    unloaded = sum(1 for manager in managers if manager.unload_model())
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return unloaded

@@ -85,11 +85,22 @@ def test_image_pipeline_selects_pallet_before_models_and_returns_sizes(tmp_path)
 
     assert result.num_fruits == 1
     frame = result.frames[0].to_dict()
+    assert frame["frame_id"] == "fruit"
+    assert frame["image_width"] == 160
+    assert frame["image_height"] == 240
     assert frame["num_fruits"] == 1
     assert frame["full_image_num_fruits"] == 1
     assert frame["num_measured_fruits"] == 1
+    assert frame["pallet_polygon"] == [[10.0, 10.0], [110.0, 10.0], [110.0, 210.0], [10.0, 210.0]]
     assert frame["fruits"][0]["size"]["width_mm"] == 20.0
-    assert result.to_dict()["average_fruit_size_mm"]["width"] == 20.0
+    assert frame["fruits"][0]["mask_area"] == 861
+    assert frame["fruits"][0]["inside_pallet"] is True
+    assert frame["fruits"][0]["pallet_overlap"] == 1.0
+    assert len(frame["fruits"][0]["mask_polygon"]) == 1
+    summary_dict = result.to_dict()
+    assert summary_dict["contract_version"] == 1
+    assert summary_dict["pallet_polygon"] == [[10.0, 10.0], [110.0, 10.0], [110.0, 210.0], [10.0, 210.0]]
+    assert summary_dict["average_fruit_size_mm"]["width"] == 20.0
     assert (tmp_path / "output/fruit_summary.json").is_file()
     assert (tmp_path / "output/fruit_result.json").is_file()
 

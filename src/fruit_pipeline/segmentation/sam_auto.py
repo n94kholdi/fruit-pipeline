@@ -100,7 +100,26 @@ class ManagedAutomaticMaskGenerator:
         self.generator = generator
 
     def generate(self, image_rgb: np.ndarray):
+        from segment_anything import SamAutomaticMaskGenerator
+
         with self.manager.inference_context():
+            model = self.manager.get_model()
+            if getattr(self.generator.predictor, "model", None) is not model:
+                self.generator = SamAutomaticMaskGenerator(
+                    model,
+                    points_per_side=self.generator.points_per_side,
+                    points_per_batch=self.generator.points_per_batch,
+                    pred_iou_thresh=self.generator.pred_iou_thresh,
+                    stability_score_thresh=self.generator.stability_score_thresh,
+                    stability_score_offset=self.generator.stability_score_offset,
+                    box_nms_thresh=self.generator.box_nms_thresh,
+                    crop_n_layers=self.generator.crop_n_layers,
+                    crop_nms_thresh=self.generator.crop_nms_thresh,
+                    crop_overlap_ratio=self.generator.crop_overlap_ratio,
+                    crop_n_points_downscale_factor=self.generator.crop_n_points_downscale_factor,
+                    min_mask_region_area=self.generator.min_mask_region_area,
+                    output_mode=self.generator.output_mode,
+                )
             return self.generator.generate(image_rgb)
 
 

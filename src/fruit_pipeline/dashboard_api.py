@@ -31,7 +31,11 @@ from fruit_pipeline.integrated_pipeline import media_source_stem, normalize_to_r
 from fruit_pipeline.live import FruitLiveReporter
 from fruit_pipeline.pallet_geometry.pallet_config import PalletTypeConfig
 from fruit_pipeline.pipeline import resolve_device
-from fruit_pipeline.segmentation.sam_manager import env_flag, get_sam_model_manager
+from fruit_pipeline.segmentation.sam_manager import (
+    clear_sam_model_cache,
+    env_flag,
+    get_sam_model_manager,
+)
 
 
 DATA_DIR = Path(os.getenv("FRUIT_PIPELINE_DATA_DIR", "outputs/dashboard")).resolve()
@@ -46,6 +50,8 @@ SAM_MODEL_TYPE = os.getenv("FRUIT_PIPELINE_SAM_MODEL_TYPE", "vit_l")
 SAM_USE_FP16 = env_flag("FRUIT_PIPELINE_SAM_USE_FP16", True)
 SAM_USE_COMPILE = env_flag("FRUIT_PIPELINE_SAM_TORCH_COMPILE", False)
 SAM_USE_SDPA_ATTENTION = env_flag("FRUIT_PIPELINE_SAM_SDPA_ATTENTION", False)
+SAM_PRELOAD = env_flag("FRUIT_PIPELINE_PRELOAD", True)
+SAM_AUTO_RELEASE_GPU = env_flag("FRUIT_PIPELINE_AUTO_RELEASE_GPU", True)
 MAX_UPLOAD_BYTES = int(os.getenv("FRUIT_PIPELINE_MAX_UPLOAD_BYTES", str(1024**3)))
 WORKERS = max(1, int(os.getenv("FRUIT_PIPELINE_JOB_WORKERS", "1")))
 MAX_CAPTURED_CALIBRATION_FRAMES = 300
@@ -71,7 +77,8 @@ def preload_sam_model() -> None:
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    preload_sam_model()
+    if SAM_PRELOAD:
+        preload_sam_model()
     yield
 
 
@@ -346,16 +353,24 @@ def _artifact_url(job_id: str, path: Path) -> str:
 def _result_payload(job_id: str, output_dir: Path, source: str | Path) -> dict[str, object]:
     summary_path = output_dir / f"{media_source_stem(source)}_summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["job_id"] = job_id
     if "://" in str(source):
         # Do not expose camera credentials that may be embedded in the stream URL.
         summary["source"] = "live-stream"
     frames = summary.get("frames", [])
+    job_root = (JOB_DIR / job_id).resolve()
     for frame in frames:
         artifact_dir = Path(frame["artifact_dir"])
-        stem = Path(frame["source_image"]).stem
+        source_image = Path(frame["source_image"])
+        stem = source_image.stem
         overlay = artifact_dir / f"{stem}_measurement_debug.png"
         if overlay.is_file():
             frame["measurement_overlay_url"] = _artifact_url(job_id, overlay)
+        if source_image.is_file() and job_root in source_image.resolve().parents:
+            frame["frame_image_url"] = _artifact_url(job_id, source_image.resolve())
+        frame_result_json = artifact_dir / f"{stem}_result.json"
+        if frame_result_json.is_file() and job_root in frame_result_json.resolve().parents:
+            frame["frame_result_url"] = _artifact_url(job_id, frame_result_json.resolve())
     summary["summary_url"] = _artifact_url(job_id, summary_path)
     return summary
 
@@ -504,6 +519,29 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
         else:
             _write_job(job_id, status="failed", error=str(exc))
             reporter.emit("job_failed", status="failed", message=str(exc))
+    finally:
+        if SAM_AUTO_RELEASE_GPU:
+            unloaded = clear_sam_model_cache()
+            if unloaded:
+                logger.info("Released %d SAM model instance(s) after job %s", unloaded, job_id)
+
+
+@app.post("/api/v1/gpu/release")
+def release_gpu_memory() -> dict[str, object]:
+    """Explicitly release cached SAM models and free GPU memory for sequential services."""
+    with jobs_lock:
+        active_jobs = [
+            jid
+            for jid, record in jobs.items()
+            if record.get("status") in {"queued", "running", "cancelling"}
+        ]
+    if active_jobs:
+        raise HTTPException(
+            409,
+            f"Cannot release GPU memory while fruit jobs are active: {', '.join(active_jobs)}",
+        )
+    unloaded = clear_sam_model_cache()
+    return {"data": {"released": True, "unloaded_models": unloaded}}
 
 
 @app.get("/health")
