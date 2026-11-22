@@ -12,7 +12,11 @@ import numpy as np
 from fruit_pipeline.camera_calibration.calibration_store import CalibrationStore
 from fruit_pipeline.camera_calibration.models import CameraCalibration
 from fruit_pipeline.measurement.contour_transform import extract_primary_contour
-from fruit_pipeline.measurement.fruit_measurement import FruitMeasurement, measure_fruit_mask
+from fruit_pipeline.measurement.fruit_measurement import (
+    FruitMeasurement,
+    estimate_fruit_masks,
+    measure_fruit_mask,
+)
 from fruit_pipeline.pallet_geometry.detector import PalletDetection, PalletDetector, PalletGeometryError
 from fruit_pipeline.pallet_geometry.homography import PalletHomography, compute_pallet_homography, rectify_pallet
 from fruit_pipeline.pallet_geometry.pallet_config import PalletTypeConfig
@@ -37,6 +41,7 @@ class SizeEstimationConfig:
     max_calibration_error: float = 2.0
     debug: bool = False
     rectified_pixels_per_mm: float = 0.5
+    estimate_from_masks: bool = False
 
 
 @dataclass
@@ -47,6 +52,7 @@ class SizeEstimationResult:
     measurements: list[FruitMeasurement]
     debug_overlay: np.ndarray | None = None
     rectified_pallet: np.ndarray | None = None
+    measurement_mode: str = "calibrated"
 
     def save(self, output_dir: str | Path, stem: str = "size_estimation") -> None:
         destination = Path(output_dir)
@@ -61,6 +67,7 @@ class SizeEstimationResult:
             "projection_plane": "pallet",
             "linear_units": "mm",
             "area_units": "mm2",
+            "measurement_mode": self.measurement_mode,
             "measurements": [measurement.to_dict() for measurement in self.measurements],
         }
         (destination / f"{stem}_measurements.json").write_text(
@@ -108,13 +115,17 @@ class SizeEstimationPipeline:
                     f"Fruit {fruit.instance_id} mask shape {np.asarray(fruit.mask).shape} "
                     f"does not match image shape {image_bgr.shape[:2]}"
                 )
-            confidence = min(float(fruit.detector_score), float(fruit.sam_score))
-            try:
-                measurements.append(
-                    measure_fruit_mask(fruit.instance_id, fruit.mask, confidence, calibration, homography)
-                )
-            except PalletGeometryError as exc:
-                logger.warning("Skipping unmeasurable fruit %s: %s", fruit.instance_id, exc)
+        if self.config.estimate_from_masks:
+            measurements = estimate_fruit_masks(fruit_list)
+        else:
+            for fruit in fruit_list:
+                confidence = min(float(fruit.detector_score), float(fruit.sam_score))
+                try:
+                    measurements.append(
+                        measure_fruit_mask(fruit.instance_id, fruit.mask, confidence, calibration, homography)
+                    )
+                except PalletGeometryError as exc:
+                    logger.warning("Skipping unmeasurable fruit %s: %s", fruit.instance_id, exc)
 
         overlay = (
             draw_measurement_overlay(image_bgr, detection, fruit_list, measurements)
@@ -131,7 +142,10 @@ class SizeEstimationPipeline:
             )
             if self.config.debug else None
         )
-        return SizeEstimationResult(calibration, detection, homography, measurements, overlay, rectified)
+        return SizeEstimationResult(
+            calibration, detection, homography, measurements, overlay, rectified,
+            "estimated" if self.config.estimate_from_masks else "calibrated",
+        )
 
 
 def draw_measurement_overlay(

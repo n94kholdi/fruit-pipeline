@@ -88,6 +88,30 @@ def test_fruit_job_runs_in_process_to_reuse_startup_model(tmp_path, monkeypatch)
     assert "job-in-process" not in dashboard_api.job_processes
 
 
+def test_estimated_job_passes_mask_sizing_flag(tmp_path, monkeypatch):
+    from fruit_pipeline import integrated_cli
+
+    calls = []
+    source = tmp_path / "input.jpg"
+    source.touch()
+    monkeypatch.setattr(dashboard_api, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(dashboard_api, "CALIBRATION_DIR", tmp_path / "calibrations")
+    monkeypatch.setattr(dashboard_api, "PALLET_CONFIG", tmp_path / "pallet_types.yaml")
+    monkeypatch.setattr(integrated_cli, "main", lambda argv: calls.append(argv) or 0)
+    monkeypatch.setattr(dashboard_api, "_result_payload", lambda *_args: {})
+    with dashboard_api.jobs_lock:
+        dashboard_api.jobs.clear()
+    dashboard_api._write_job("estimated-job", kind="fruit_analysis", status="queued")
+
+    dashboard_api._run_fruit_job(
+        "estimated-job",
+        _fruit_job_request(estimate_from_masks=True),
+        source,
+    )
+
+    assert "--estimate-from-masks" in calls[0]
+
+
 def test_interval_job_validation_is_bounded_to_one_hour():
     import pytest
     from pydantic import ValidationError

@@ -7,7 +7,7 @@ import yaml
 
 from fruit_pipeline.camera_calibration.calibration_store import CalibrationStore
 from fruit_pipeline.camera_calibration.models import CalibrationError, CameraCalibration
-from fruit_pipeline.measurement.fruit_measurement import measure_fruit_mask
+from fruit_pipeline.measurement.fruit_measurement import estimate_fruit_masks, measure_fruit_mask
 from fruit_pipeline.pallet_geometry.detector import PalletDetection, PalletGeometryError
 from fruit_pipeline.pallet_geometry.homography import compute_pallet_homography
 from fruit_pipeline.pallet_geometry.pallet_config import PalletDimensions
@@ -60,6 +60,27 @@ def test_homography_and_measurement_return_real_units():
     assert measured.length_mm == pytest.approx(40, abs=0.01)
     assert measured.area_mm2 == pytest.approx(800, abs=0.1)
     assert measured.equivalent_diameter_mm == pytest.approx(np.sqrt(3200 / np.pi), abs=0.01)
+
+
+def test_mask_estimates_are_plausible_and_preserve_relative_size():
+    masks = []
+    for fruit_id, radius in enumerate((12, 20, 32), 1):
+        mask = np.zeros((100, 100), np.uint8)
+        cv2.circle(mask, (50, 50), radius, 1, thickness=-1)
+        masks.append(Fruit(fruit_id, 0.9, 0.8, mask))
+
+    measured = estimate_fruit_masks(masks)
+
+    diameters = [item.equivalent_diameter_mm for item in measured]
+    assert diameters[0] < diameters[1] < diameters[2]
+    assert diameters[1] == pytest.approx(75.0)
+    assert all(55.0 <= value <= 95.0 for value in diameters)
+    assert all(50.0 <= item.width_mm <= 95.0 for item in measured)
+    assert all(55.0 <= item.length_mm <= 110.0 for item in measured)
+    for item in measured:
+        assert item.area_mm2 == pytest.approx(
+            np.pi * item.equivalent_diameter_mm**2 / 4.0
+        )
 
 
 def test_crossed_or_degenerate_corners_are_rejected():
@@ -127,3 +148,26 @@ def test_pipeline_produces_measurement_and_debug_views(tmp_path):
     assert (tmp_path / "outputs/frame_1_measurements.json").is_file()
     assert (tmp_path / "outputs/frame_1_measurement_debug.png").is_file()
     assert (tmp_path / "outputs/frame_1_rectified_pallet.png").is_file()
+
+
+def test_pipeline_can_use_mask_relative_estimates_without_changing_calibrated_default(tmp_path):
+    small = np.zeros((240, 160), bool)
+    small[40:60, 30:50] = True
+    large = np.zeros((240, 160), bool)
+    large[80:120, 70:110] = True
+    estimator = pipeline(tmp_path, Detector())
+    estimator.config = SizeEstimationConfig(
+        camera_id=estimator.config.camera_id,
+        calibration_dir=estimator.config.calibration_dir,
+        pallet_config_path=estimator.config.pallet_config_path,
+        estimate_from_masks=True,
+    )
+
+    result = estimator.run(
+        np.zeros((240, 160, 3), np.uint8),
+        [Fruit(1, 0.9, 0.8, small), Fruit(2, 0.9, 0.8, large)],
+    )
+
+    assert result.measurement_mode == "estimated"
+    assert result.measurements[0].equivalent_diameter_mm < result.measurements[1].equivalent_diameter_mm
+    assert [item.equivalent_diameter_mm for item in result.measurements] == [55.0, 95.0]

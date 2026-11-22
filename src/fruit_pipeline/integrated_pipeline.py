@@ -130,6 +130,7 @@ class FrameResult:
             "num_fruits": self.num_fruits,
             "full_image_num_fruits": self.full_image_num_fruits,
             "num_measured_fruits": len(measurements),
+            "measurement_mode": self.sizing.measurement_mode,
             "pallet_type": self.sizing.pallet_detection.pallet_type,
             "pallet_confidence": self.sizing.pallet_detection.confidence,
             "artifact_dir": self.artifact_dir,
@@ -178,6 +179,9 @@ class MediaResult:
             "processed_frame_count": len(self.frames),
             "total_fruit_observations": self.num_fruits,
             "average_fruit_size_mm": self.average_size_mm,
+            "measurement_mode": (
+                self.frames[0].sizing.measurement_mode if self.frames else "calibrated"
+            ),
             "frames": [frame.to_dict() for frame in self.frames],
         }
 

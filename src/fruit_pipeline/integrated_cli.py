@@ -138,6 +138,11 @@ def build_parser():
     )
     sizing.add_argument("--min-pallet-confidence", type=float, default=0.5)
     sizing.add_argument(
+        "--estimate-from-masks",
+        action="store_true",
+        help="Return plausible mask-relative fruit sizes instead of calibrated physical measurements.",
+    )
+    sizing.add_argument(
         "--reuse-pallet-selection",
         action="store_true",
         help="Reuse an existing --pallet-selection instead of selecting the pallet at the start of this run.",
@@ -285,6 +290,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_calibration_error=args.max_calibration_error,
         debug=not args.no_size_debug,
         rectified_pixels_per_mm=args.rectified_pixels_per_mm,
+        estimate_from_masks=args.estimate_from_masks,
     )
     video_segmentation_kwargs = {}
     if args.tracking_enabled is not None:

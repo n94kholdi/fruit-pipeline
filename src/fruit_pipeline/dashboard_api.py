@@ -110,6 +110,7 @@ class FruitJobRequest(BaseModel):
     min_pallet_overlap: float = Field(default=0.5, ge=0, le=1)
     resize_to_calibration: bool = True
     allow_unsafe_resize: bool = False
+    estimate_from_masks: bool = False
     max_frames: int | None = Field(default=None, ge=1)
     # The current dashboard uses interval mode: SAM-only inference at a
     # user-selected timestamp, with static masks between runs. Legacy preserves
@@ -471,6 +472,8 @@ def _run_fruit_job(job_id: str, request: FruitJobRequest, source: str | Path) ->
         command.append("--resize-to-calibration")
     if request.allow_unsafe_resize:
         command.append("--allow-unsafe-resize")
+    if request.estimate_from_masks:
+        command.append("--estimate-from-masks")
     if request.max_frames is not None:
         command.extend(["--max-frames", str(request.max_frames)])
     try:
@@ -760,6 +763,7 @@ def create_fruit_job(request: FruitJobRequest) -> dict[str, object]:
             if request.processing_mode == "interval"
             else None
         ),
+        measurement_mode="estimated" if request.estimate_from_masks else "calibrated",
     )
     future = executor.submit(_run_fruit_job, job_id, request, sources[0])
     with jobs_lock:
